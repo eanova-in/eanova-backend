@@ -20,7 +20,7 @@ mongoose.connect(process.env.MONGO_URI)
 // মেমোরিতে সাময়িকভাবে OTP ধরে রাখার অবজেক্ট
 const otpStore = {};
 
-// Transporter তৈরি (Gmail App Password দিয়ে)
+// Gmail Transporter
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
@@ -29,54 +29,62 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// ১. OTP পাঠানোর API
+// সহায়ক ফাংশন: ইমেইলে OTP পাঠানো
+const sendOtpEmail = async (email, otp, subjectTitle) => {
+  const mailOptions = {
+    from: `"Eanova Support" <${process.env.EMAIL_USER}>`,
+    to: email,
+    subject: `Eanova - ${subjectTitle}`,
+    html: `
+      <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4;">
+        <h2 style="color: #333;">Eanova Verification</h2>
+        <p>Your OTP code for ${subjectTitle.toLowerCase()} is:</p>
+        <h1 style="color: #007bff; letter-spacing: 5px;">${otp}</h1>
+        <p>This code will expire in 5 minutes.</p>
+      </div>
+    `
+  };
+  await transporter.sendMail(mailOptions);
+};
+
+// ==========================================
+// ১ & ২. রেজিস্ট্রেশনের জন্য OTP পাঠানো ও ভেরিফাই
+// ==========================================
+
+// রেজিস্টার OTP পাঠানো
 app.post('/api/send-otp', async (req, res) => {
   try {
-    const { email } = req.body;
+    let { email } = req.body;
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
+    email = email.toLowerCase().trim();
     const existingUser = await User.findOne({ email });
     if (existingUser) return res.status(400).json({ message: 'User already exists' });
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     otpStore[email] = { otp, expiresAt: Date.now() + 5 * 60 * 1000 };
 
-    const mailOptions = {
-      from: `"Eanova Support" <${process.env.EMAIL_USER}>`,
-      to: email,
-      subject: 'Eanova - Verification OTP Code',
-      html: `
-        <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4;">
-          <h2 style="color: #333;">Welcome to Eanova!</h2>
-          <p>Your OTP code for verification is:</p>
-          <h1 style="color: #007bff; letter-spacing: 5px;">${otp}</h1>
-          <p>This code will expire in 5 minutes.</p>
-        </div>
-      `
-    };
-
-    await transporter.sendMail(mailOptions);
-    res.json({ message: 'OTP sent to email successfully!' });
+    await sendOtpEmail(email, otp, 'Account Verification OTP');
+    res.json({ message: 'OTP sent to your email successfully!' });
   } catch (error) {
-    console.error('Error sending OTP:', error);
+    console.error('Error sending register OTP:', error);
     res.status(500).json({ message: 'Failed to send OTP email' });
   }
 });
 
-// ২. OTP যাচাই করে সাইন-আপ সম্পন্ন করার API
+// OTP ভেরিফাই করে রেজিস্টার সম্পন্ন করা
 app.post('/api/verify-otp', async (req, res) => {
   try {
-    const { name, firm, email, password, region, otp } = req.body;
+    let { name, firm, email, password, region, otp } = req.body;
+    email = email.toLowerCase().trim();
 
     const record = otpStore[email];
-    if (!record) return res.status(400).json({ message: 'OTP not requested or expired' });
+    if (!record) return res.status(400).json({ message: 'OTP expired or not requested' });
     if (record.expiresAt < Date.now()) {
       delete otpStore[email];
-      return res.status(400).json({ message: 'OTP expired! Please request again.' });
+      return res.status(400).json({ message: 'OTP expired! Request again.' });
     }
-    if (record.otp !== otp) {
-      return res.status(400).json({ message: 'Invalid OTP code' });
-    }
+    if (record.otp !== otp) return res.status(400).json({ message: 'Invalid OTP code' });
 
     delete otpStore[email];
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -89,18 +97,72 @@ app.post('/api/verify-otp', async (req, res) => {
       region
     });
 
-    await newUser.save();
+    await newUser.save(); // সরাসরি MongoDB ডাটাবেসে সেভ হবে
     res.status(201).json({ message: 'Account verified & registered successfully!' });
   } catch (error) {
     console.error('Error verifying OTP:', error);
-    res.status(500).json({ message: 'Server error during OTP verification' });
+    res.status(500).json({ message: 'Server error during registration' });
   }
 });
 
-// ৩. লগইন এপিআই
+// ==========================================
+// ৩. ভুলে যাওয়া পাসওয়ার্ডের জন্য OTP ও রিসেট
+// ==========================================
+
+// ফরগট পাসওয়ার্ডের OTP ইমেইলে পাঠানো
+app.post('/api/forgot-password-otp', async (req, res) => {
+  try {
+    let { email } = req.body;
+    if (!email) return res.status(400).json({ message: 'Email is required' });
+
+    email = email.toLowerCase().trim();
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ message: 'No account found with this email' });
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    otpStore[`reset_${email}`] = { otp, expiresAt: Date.now() + 5 * 60 * 1000 };
+
+    await sendOtpEmail(email, otp, 'Password Reset OTP');
+    res.json({ message: 'Password reset OTP sent to your email!' });
+  } catch (error) {
+    console.error('Error sending reset OTP:', error);
+    res.status(500).json({ message: 'Failed to send reset OTP email' });
+  }
+});
+
+// OTP দিয়ে পাসওয়ার্ড রিসেট করা
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    let { email, otp, newPassword } = req.body;
+    email = email.toLowerCase().trim();
+
+    const record = otpStore[`reset_${email}`];
+    if (!record) return res.status(400).json({ message: 'OTP expired or not requested' });
+    if (record.expiresAt < Date.now()) {
+      delete otpStore[`reset_${email}`];
+      return res.status(400).json({ message: 'OTP expired!' });
+    }
+    if (record.otp !== otp) return res.status(400).json({ message: 'Invalid OTP code' });
+
+    delete otpStore[`reset_${email}`];
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    await User.findOneAndUpdate({ email }, { password: hashedPassword });
+    res.json({ message: 'Password updated successfully! You can login now.' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error resetting password' });
+  }
+});
+
+// ==========================================
+// ৪. লগইন এবং ইউজার ডাটা (প্রোফাইল, ক্লায়েন্ট, প্ল্যান)
+// ==========================================
+
+// লগইন এপিআই (সব ডাটা সহ রেসপন্স দেবে)
 app.post('/api/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    let { email, password } = req.body;
+    email = email.toLowerCase().trim();
 
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ message: 'User not found' });
@@ -108,15 +170,20 @@ app.post('/api/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secretkey', { expiresIn: '1d' });
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secretkey', { expiresIn: '7d' });
 
+    // যেকোনো ডিভাইস থেকে লগইন করলেই ডাটাবেসের সর্বশেষ প্রোফাইল ও সাবস্ক্রিপশন ডাটা রিটার্ন করবে
     res.json({ 
       token, 
       user: {
+        id: user._id,
         name: user.name,
         firm: user.firm,
         email: user.email,
-        region: user.region
+        region: user.region,
+        profilePic: user.profilePic || '',
+        subscriptionActive: user.subscriptionActive || false,
+        clients: user.clients || []
       },
       message: 'Login successful!' 
     });
@@ -125,27 +192,57 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ৪. ইউজারের ক্লায়েন্ট লিস্ট ও সাবস্ক্রিপশন ডাটা ফ্রেচ করার এপিআই
+// যেকোনো ডিভাইস থেকে সম্পূর্ণ ডাটা সিঙ্ক করে আনার API
 app.get('/api/user-data', async (req, res) => {
   try {
-    const { email } = req.query;
+    let { email } = req.query;
+    if (!email) return res.status(400).json({ message: 'Email is required' });
+
+    email = email.toLowerCase().trim();
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: 'User not found' });
     
     res.json({ 
-      user: { name: user.name, firm: user.firm, email: user.email, region: user.region },
-      clients: user.clients || [],
-      subscriptionActive: user.subscriptionActive || false
+      user: { 
+        name: user.name, 
+        firm: user.firm, 
+        email: user.email, 
+        region: user.region,
+        profilePic: user.profilePic || '',
+        subscriptionActive: user.subscriptionActive || false 
+      },
+      clients: user.clients || []
     });
   } catch (err) {
     res.status(500).json({ message: 'Server error fetching user data' });
   }
 });
 
-// ৫. নতুন ক্লায়েন্ট সেভ করার এপিআই
+// প্রোফাইল ফটো বা ডাটা সেভ/আপডেট করা
+app.post('/api/update-profile', async (req, res) => {
+  try {
+    let { email, profilePic, firm, name } = req.body;
+    email = email.toLowerCase().trim();
+
+    const user = await User.findOneAndUpdate(
+      { email },
+      { $set: { profilePic, firm, name } },
+      { new: true }
+    );
+    
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json({ message: 'Profile updated successfully', user });
+  } catch (err) {
+    res.status(500).json({ message: 'Error updating profile' });
+  }
+});
+
+// ক্লায়েন্ট সেভ করা
 app.post('/api/save-client', async (req, res) => {
   try {
-    const { email, clientData } = req.body;
+    let { email, clientData } = req.body;
+    email = email.toLowerCase().trim();
+
     const user = await User.findOneAndUpdate(
       { email },
       { $push: { clients: clientData } },
