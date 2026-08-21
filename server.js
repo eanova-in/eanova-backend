@@ -10,7 +10,13 @@ const User = require('./User');
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+
+// CORS কনফিগারেশন (যেকোনো ফ্রন্টএন্ড ডোমেইন ও Netlify থেকে কানেকশন এলাও করার জন্য)
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 // MongoDB কানেকশন
 mongoose.connect(process.env.MONGO_URI)
@@ -97,7 +103,7 @@ app.post('/api/verify-otp', async (req, res) => {
       region
     });
 
-    await newUser.save(); // সরাসরি MongoDB ডাটাবেসে সেভ হবে
+    await newUser.save();
     res.status(201).json({ message: 'Account verified & registered successfully!' });
   } catch (error) {
     console.error('Error verifying OTP:', error);
@@ -158,7 +164,7 @@ app.post('/api/reset-password', async (req, res) => {
 // ৪. লগইন এবং ইউজার ডাটা (প্রোফাইল, ক্লায়েন্ট, প্ল্যান)
 // ==========================================
 
-// লগইন এপিআই (সব ডাটা সহ রেসপন্স দেবে)
+// লগইন এপিআই
 app.post('/api/login', async (req, res) => {
   try {
     let { email, password } = req.body;
@@ -172,7 +178,6 @@ app.post('/api/login', async (req, res) => {
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'secretkey', { expiresIn: '7d' });
 
-    // যেকোনো ডিভাইস থেকে লগইন করলেই ডাটাবেসের সর্বশেষ প্রোফাইল ও সাবস্ক্রিপশন ডাটা রিটার্ন করবে
     res.json({ 
       token, 
       user: {
@@ -192,7 +197,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// যেকোনো ডিভাইস থেকে সম্পূর্ণ ডাটা সিঙ্ক করে আনার API
+// ডাটা সিঙ্ক করার API
 app.get('/api/user-data', async (req, res) => {
   try {
     let { email } = req.query;
@@ -218,7 +223,7 @@ app.get('/api/user-data', async (req, res) => {
   }
 });
 
-// প্রোফাইল ফটো বা ডাটা সেভ/আপডেট করা
+// প্রোফাইল আপডেট
 app.post('/api/update-profile', async (req, res) => {
   try {
     let { email, profilePic, firm, name } = req.body;
