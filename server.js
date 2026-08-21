@@ -17,10 +17,10 @@ mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully!'))
   .catch(err => console.log('DB Error:', err));
 
-// মেমোরিতে সাময়িকভাবে OTP ও ইউজার ডাটা ধরে রাখার অবজেক্ট
+// মেমোরিতে সাময়িকভাবে OTP ধরে রাখার অবজেক্ট
 const otpStore = {};
 
-// Transporter তৈরি (Gmail App Password দিয়ে)
+// Transporter তৈরি (Gmail App Password দিয়ে)
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
@@ -38,9 +38,8 @@ app.post('/api/send-otp', async (req, res) => {
     const existingUser = await User.findOne({ email });
     if (existingUser) return res.status(400).json({ message: 'User already exists' });
 
-    // ৬ ডিজিটের এলোমেলো OTP জেনারেট করা
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    otpStore[email] = { otp, expiresAt: Date.now() + 5 * 60 * 1000 }; // ৫ মিনিটের মেয়াদ
+    otpStore[email] = { otp, expiresAt: Date.now() + 5 * 60 * 1000 };
 
     const mailOptions = {
       from: `"Eanova Support" <${process.env.EMAIL_USER}>`,
@@ -79,7 +78,6 @@ app.post('/api/verify-otp', async (req, res) => {
       return res.status(400).json({ message: 'Invalid OTP code' });
     }
 
-    // OTP সঠিক হলে ইউজার ডাটাবেসে সেভ
     delete otpStore[email];
     const hashedPassword = await bcrypt.hash(password, 10);
 
