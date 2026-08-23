@@ -3,12 +3,8 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
-const dns = require('dns');
+const { Resend } = require('resend');
 require('dotenv').config();
-
-// ========== IPv4 ফোর্স করা ==========
-dns.setDefaultResultOrder('ipv4first');
 
 const User = require('./User');
 
@@ -21,33 +17,21 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+// MongoDB Connection
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully!'))
   .catch(err => console.log('DB Error:', err));
 
+// Resend Client
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// Temporary OTP Store
 const otpStore = {};
 
-// Gmail Transporter (SSL পোর্ট 465)
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 465,
-  secure: true,          // SSL ব্যবহার
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  },
-  tls: {
-    rejectUnauthorized: false
-  },
-  connectionTimeout: 10000, // 10 সেকেন্ড টাইমআউট
-  greetingTimeout: 10000,
-  socketTimeout: 10000,
-  family: 4               // IPv4 ফোর্স
-});
-
+// Helper: Send OTP via Resend
 const sendOtpEmail = async (email, otp, subjectTitle) => {
-  const mailOptions = {
-    from: `"Eanova Support" <${process.env.EMAIL_USER}>`,
+  const { data, error } = await resend.emails.send({
+    from: 'Eanova <onboarding@resend.dev>', // Resend-এর ডিফল্ট স্যান্ডবক্স ডোমেইন
     to: email,
     subject: `Eanova - ${subjectTitle}`,
     html: `
@@ -58,11 +42,16 @@ const sendOtpEmail = async (email, otp, subjectTitle) => {
         <p>This code will expire in 5 minutes.</p>
       </div>
     `
-  };
-  await transporter.sendMail(mailOptions);
+  });
+
+  if (error) {
+    console.error('Resend error:', error);
+    throw new Error('Failed to send email');
+  }
+  return data;
 };
 
-// ======= রেজিস্টার OTP =======
+// ===================== REGISTER =====================
 app.post('/api/send-otp', async (req, res) => {
   try {
     console.log('Received OTP request for email:', req.body.email);
@@ -80,11 +69,10 @@ app.post('/api/send-otp', async (req, res) => {
     res.json({ message: 'OTP sent to your email successfully!' });
   } catch (error) {
     console.error('Error sending register OTP:', error);
-    res.status(500).json({ message: 'Failed to send OTP email' });
+    res.status(500).json({ message: 'Failed to send OTP email. Please try again.' });
   }
 });
 
-// ======= OTP Verify =======
 app.post('/api/verify-otp', async (req, res) => {
   try {
     let { name, firm, email, password, region, otp } = req.body;
@@ -117,7 +105,7 @@ app.post('/api/verify-otp', async (req, res) => {
   }
 });
 
-// ======= Forgot Password OTP =======
+// ===================== FORGOT PASSWORD =====================
 app.post('/api/forgot-password-otp', async (req, res) => {
   try {
     let { email } = req.body;
@@ -138,7 +126,6 @@ app.post('/api/forgot-password-otp', async (req, res) => {
   }
 });
 
-// ======= Reset Password =======
 app.post('/api/reset-password', async (req, res) => {
   try {
     let { email, otp, newPassword } = req.body;
@@ -163,7 +150,7 @@ app.post('/api/reset-password', async (req, res) => {
   }
 });
 
-// ======= Login =======
+// ===================== LOGIN =====================
 app.post('/api/login', async (req, res) => {
   try {
     let { email, password } = req.body;
@@ -197,7 +184,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ======= অন্যান্য API (user-data, update-profile, save-client) =======
+// ===================== USER DATA =====================
 app.get('/api/user-data', async (req, res) => {
   try {
     let { email } = req.query;
