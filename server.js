@@ -4,33 +4,34 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
+const dns = require('dns');
 require('dotenv').config();
+
+// ========== IPv4 ফোর্স করা ==========
+dns.setDefaultResultOrder('ipv4first');
 
 const User = require('./User');
 
 const app = express();
 app.use(express.json());
 
-// CORS কনফিগারেশন (যেকোনো ফ্রন্টএন্ড ডোমেইন ও Netlify থেকে কানেকশন এলাও করার জন্য)
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// MongoDB কানেকশন
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully!'))
   .catch(err => console.log('DB Error:', err));
 
-// মেমোরিতে সাময়িকভাবে OTP ধরে রাখার অবজেক্ট
 const otpStore = {};
 
-// Gmail Transporter (IPv4 ফোর্স করা হয়েছে)
+// Gmail Transporter (SSL পোর্ট 465)
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
+  port: 465,
+  secure: true,          // SSL ব্যবহার
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
@@ -38,10 +39,12 @@ const transporter = nodemailer.createTransport({
   tls: {
     rejectUnauthorized: false
   },
-  family: 4   // ← এই লাইনটি IPv6 সমস্যা সমাধান করবে
+  connectionTimeout: 10000, // 10 সেকেন্ড টাইমআউট
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
+  family: 4               // IPv4 ফোর্স
 });
 
-// সহায়ক ফাংশন: ইমেইলে OTP পাঠানো
 const sendOtpEmail = async (email, otp, subjectTitle) => {
   const mailOptions = {
     from: `"Eanova Support" <${process.env.EMAIL_USER}>`,
@@ -59,14 +62,10 @@ const sendOtpEmail = async (email, otp, subjectTitle) => {
   await transporter.sendMail(mailOptions);
 };
 
-// ==========================================
-// ১ & ২. রেজিস্ট্রেশনের জন্য OTP পাঠানো ও ভেরিফাই
-// ==========================================
-
-// রেজিস্টার OTP পাঠানো
+// ======= রেজিস্টার OTP =======
 app.post('/api/send-otp', async (req, res) => {
   try {
-    console.log('Received OTP request for email:', req.body.email); // ডিবাগ লাইন
+    console.log('Received OTP request for email:', req.body.email);
     let { email } = req.body;
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
@@ -85,7 +84,7 @@ app.post('/api/send-otp', async (req, res) => {
   }
 });
 
-// OTP ভেরিফাই করে রেজিস্টার সম্পন্ন করা
+// ======= OTP Verify =======
 app.post('/api/verify-otp', async (req, res) => {
   try {
     let { name, firm, email, password, region, otp } = req.body;
@@ -118,11 +117,7 @@ app.post('/api/verify-otp', async (req, res) => {
   }
 });
 
-// ==========================================
-// ৩. ভুলে যাওয়া পাসওয়ার্ডের জন্য OTP ও রিসেট
-// ==========================================
-
-// ফরগট পাসওয়ার্ডের OTP ইমেইলে পাঠানো
+// ======= Forgot Password OTP =======
 app.post('/api/forgot-password-otp', async (req, res) => {
   try {
     let { email } = req.body;
@@ -143,7 +138,7 @@ app.post('/api/forgot-password-otp', async (req, res) => {
   }
 });
 
-// OTP দিয়ে পাসওয়ার্ড রিসেট করা
+// ======= Reset Password =======
 app.post('/api/reset-password', async (req, res) => {
   try {
     let { email, otp, newPassword } = req.body;
@@ -168,11 +163,7 @@ app.post('/api/reset-password', async (req, res) => {
   }
 });
 
-// ==========================================
-// ৪. লগইন এবং ইউজার ডাটা (প্রোফাইল, ক্লায়েন্ট, প্ল্যান)
-// ==========================================
-
-// লগইন এপিআই
+// ======= Login =======
 app.post('/api/login', async (req, res) => {
   try {
     let { email, password } = req.body;
@@ -206,7 +197,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ডাটা সিঙ্ক করার API
+// ======= অন্যান্য API (user-data, update-profile, save-client) =======
 app.get('/api/user-data', async (req, res) => {
   try {
     let { email } = req.query;
@@ -233,7 +224,6 @@ app.get('/api/user-data', async (req, res) => {
   }
 });
 
-// প্রোফাইল আপডেট
 app.post('/api/update-profile', async (req, res) => {
   try {
     let { email, profilePic, firm, name } = req.body;
@@ -253,7 +243,6 @@ app.post('/api/update-profile', async (req, res) => {
   }
 });
 
-// ক্লায়েন্ট সেভ করা
 app.post('/api/save-client', async (req, res) => {
   try {
     let { email, clientData } = req.body;
