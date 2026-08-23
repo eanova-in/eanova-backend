@@ -26,7 +26,7 @@ mongoose.connect(process.env.MONGO_URI)
 // মেমোরিতে সাময়িকভাবে OTP ধরে রাখার অবজেক্ট
 const otpStore = {};
 
-// Gmail Transporter
+// Gmail Transporter (IPv4 ফোর্স করা হয়েছে)
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
   port: 587,
@@ -37,7 +37,8 @@ const transporter = nodemailer.createTransport({
   },
   tls: {
     rejectUnauthorized: false
-  }
+  },
+  family: 4   // ← এই লাইনটি IPv6 সমস্যা সমাধান করবে
 });
 
 // সহায়ক ফাংশন: ইমেইলে OTP পাঠানো
@@ -65,6 +66,7 @@ const sendOtpEmail = async (email, otp, subjectTitle) => {
 // রেজিস্টার OTP পাঠানো
 app.post('/api/send-otp', async (req, res) => {
   try {
+    console.log('Received OTP request for email:', req.body.email); // ডিবাগ লাইন
     let { email } = req.body;
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
@@ -161,6 +163,7 @@ app.post('/api/reset-password', async (req, res) => {
     await User.findOneAndUpdate({ email }, { password: hashedPassword });
     res.json({ message: 'Password updated successfully! You can login now.' });
   } catch (error) {
+    console.error('Error resetting password:', error);
     res.status(500).json({ message: 'Server error resetting password' });
   }
 });
@@ -198,6 +201,7 @@ app.post('/api/login', async (req, res) => {
       message: 'Login successful!' 
     });
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ message: 'Server Error during login' });
   }
 });
@@ -224,6 +228,7 @@ app.get('/api/user-data', async (req, res) => {
       clients: user.clients || []
     });
   } catch (err) {
+    console.error('Error fetching user data:', err);
     res.status(500).json({ message: 'Server error fetching user data' });
   }
 });
@@ -243,6 +248,7 @@ app.post('/api/update-profile', async (req, res) => {
     if (!user) return res.status(404).json({ message: 'User not found' });
     res.json({ message: 'Profile updated successfully', user });
   } catch (err) {
+    console.error('Profile update error:', err);
     res.status(500).json({ message: 'Error updating profile' });
   }
 });
@@ -262,6 +268,7 @@ app.post('/api/save-client', async (req, res) => {
     
     res.json({ message: 'Client saved successfully', clients: user.clients });
   } catch (err) {
+    console.error('Error saving client:', err);
     res.status(500).json({ message: 'Server error saving client' });
   }
 });
