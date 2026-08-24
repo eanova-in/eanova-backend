@@ -28,10 +28,13 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 // Temporary OTP Store
 const otpStore = {};
 
+// আপনার ভেরিফাই করা ডোমেইনের ইমেইল ব্যবহার করুন
+const FROM_EMAIL = 'Eanova <noreply@eanova.in>';  // এখন এটি কাজ করবে
+
 // Helper: Send OTP via Resend
 const sendOtpEmail = async (email, otp, subjectTitle) => {
   const { data, error } = await resend.emails.send({
-    from: 'Eanova <onboarding@resend.dev>', // Resend-এর ডিফল্ট স্যান্ডবক্স ডোমেইন
+    from: FROM_EMAIL,
     to: email,
     subject: `Eanova - ${subjectTitle}`,
     html: `
