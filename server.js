@@ -200,20 +200,10 @@ app.post('/api/reset-password', async (req, res) => {
 // ৬. ইউজারের ক্লায়েন্ট লিস্ট ও সাবস্ক্রিপশন ডাটা ফেচ করা
 // ============================================================
 app.get('/api/user-data', async (req, res) => {
-  // This response must never be cached by the browser. Without this header,
-  // the browser was free to reuse a cached copy from before a purchase and
-  // return it as an HTTP 304 — which is exactly what was making a plan
-  // that saved correctly on the server still disappear on refresh: the
-  // fresh request never actually reached this handler, so even correct
-  // server-side data never had a chance to reach the page.
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   try {
     const { email } = req.query;
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: 'User not found' });
-
-    // TEMPORARY DIAGNOSTIC — same purpose as the one in /api/update-profile.
-    console.log('[DIAG user-data] email queried:', email, '| subscriptionActive found:', user.subscriptionActive, '| _id:', user._id.toString());
 
     res.json({
       user: {
@@ -243,56 +233,30 @@ app.post('/api/update-profile', async (req, res) => {
     const { email, subscriptionActive, activePlan, subscriptionExpiry, hasPaidBefore, profilePic, name, firm } = req.body;
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
-    // Load the document and set fields directly, then call .save().
-    // findOneAndUpdate() with a plain update object was silently not
-    // persisting subscriptionActive/activePlan/subscriptionExpiry even
-    // though it returned 200 and even echoed back the correct values in
-    // its own response — the write simply wasn't landing. Loading the
-    // document, assigning fields on it directly, and calling .save()
-    // is a completely different Mongoose code path (goes through the
-    // document's own change-tracking rather than an update-query
-    // builder) and sidesteps whatever was swallowing the update.
-    const user = await User.findOne({ email });
+    const update = {};
+    if (typeof subscriptionActive === 'boolean') update.subscriptionActive = subscriptionActive;
+    if (activePlan !== undefined) update.activePlan = activePlan;
+    if (subscriptionExpiry !== undefined) update.subscriptionExpiry = subscriptionExpiry;
+    if (typeof hasPaidBefore === 'boolean') update.hasPaidBefore = hasPaidBefore;
+    if (profilePic !== undefined) update.profilePic = profilePic;
+    if (name !== undefined) update.name = name;
+    if (firm !== undefined) update.firm = firm;
+
+    const user = await User.findOneAndUpdate({ email }, update, { new: true });
     if (!user) return res.status(404).json({ message: 'User not found' });
-
-    if (typeof subscriptionActive === 'boolean') user.subscriptionActive = subscriptionActive;
-    if (activePlan !== undefined) user.activePlan = activePlan;
-    if (subscriptionExpiry !== undefined) user.subscriptionExpiry = subscriptionExpiry;
-    if (typeof hasPaidBefore === 'boolean') user.hasPaidBefore = hasPaidBefore;
-    if (profilePic !== undefined) user.profilePic = profilePic;
-    if (name !== undefined) user.name = name;
-    if (firm !== undefined) user.firm = firm;
-
-    user.markModified('subscriptionActive');
-    user.markModified('activePlan');
-    user.markModified('subscriptionExpiry');
-
-    await user.save();
-
-    // Immediately re-read from the database (not from the in-memory
-    // object just saved) as a hard verification that the write actually
-    // landed. If it didn't, fail loudly with a 500 instead of returning
-    // a false "success" — the frontend's retry logic (see payBtn
-    // handler) already knows how to handle a failed save safely, but it
-    // can only do that if a real failure is reported as one.
-    const verify = await User.findOne({ email });
-    if (!verify || (typeof subscriptionActive === 'boolean' && verify.subscriptionActive !== subscriptionActive)) {
-      console.error('[update-profile] Save verification FAILED for', email, '— wrote', subscriptionActive, 'but re-read got', verify && verify.subscriptionActive);
-      return res.status(500).json({ message: 'Save did not persist — please try again' });
-    }
 
     res.json({
       message: 'Profile updated successfully',
       user: {
-        name: verify.name,
-        firm: verify.firm,
-        email: verify.email,
-        region: verify.region,
-        subscriptionActive: verify.subscriptionActive,
-        activePlan: verify.activePlan,
-        subscriptionExpiry: verify.subscriptionExpiry,
-        hasPaidBefore: verify.hasPaidBefore,
-        profilePic: verify.profilePic
+        name: user.name,
+        firm: user.firm,
+        email: user.email,
+        region: user.region,
+        subscriptionActive: user.subscriptionActive,
+        activePlan: user.activePlan,
+        subscriptionExpiry: user.subscriptionExpiry,
+        hasPaidBefore: user.hasPaidBefore,
+        profilePic: user.profilePic
       }
     });
   } catch (err) {
