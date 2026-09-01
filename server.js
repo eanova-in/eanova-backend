@@ -22,29 +22,39 @@ const otpStore = {};
 const resetOtpStore = {};
 
 // ============================================================
-// NODEMAILER – IPv4 ফোর্স + টাইমআউট বাড়ানো
+// ✅ Gmail Transporter – IPv4 ফোর্স + টাইমআউট বাড়ানো
 // ============================================================
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
   port: 587,
-  secure: false, // TLS ব্যবহার
+  secure: false, // TLS
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
   },
-  tls: {
-    rejectUnauthorized: false,
-    ciphers: 'SSLv3'
-  },
-  connectionTimeout: 30000,  // 30 সেকেন্ড
-  greetingTimeout: 30000,
-  socketTimeout: 30000,
-  // Node.js কে IPv4 ব্যবহার করতে বাধ্য করা (IPv6 ব্লক এড়াতে)
-  family: 4
+  family: 4,                // ← IPv4 বাধ্য
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
+  pool: true,
+  maxConnections: 1,
+  rateLimit: 5
 });
 
-function sendOtpEmail(email, otp, subjectLine) {
-  return transporter.sendMail({
+// ট্রান্সপোর্টার ভেরিফাই (ডিবাগ)
+transporter.verify(function(error, success) {
+  if (error) {
+    console.log('SMTP connection error:', error);
+  } else {
+    console.log('SMTP server is ready to send emails');
+  }
+});
+
+// ============================================================
+// OTP ইমেইল পাঠানোর ফাংশন
+// ============================================================
+async function sendOtpEmail(email, otp, subjectLine) {
+  const mailOptions = {
     from: `"Eanova Support" <${process.env.EMAIL_USER}>`,
     to: email,
     subject: subjectLine,
@@ -56,7 +66,16 @@ function sendOtpEmail(email, otp, subjectLine) {
         <p>This code will expire in 5 minutes.</p>
       </div>
     `
-  });
+  };
+  
+  try {
+    const info = await transporter.sendMail(mailOptions);
+    console.log('Email sent successfully to:', email);
+    return info;
+  } catch (err) {
+    console.error('SendMail error:', err);
+    throw err;
+  }
 }
 
 // ============================================================
@@ -77,7 +96,7 @@ app.post('/api/send-otp', async (req, res) => {
     res.json({ message: 'OTP sent to email successfully!' });
   } catch (error) {
     console.error('Error sending OTP:', error);
-    res.status(500).json({ message: 'Failed to send OTP email' });
+    res.status(500).json({ message: 'Failed to send OTP email. Please try again.' });
   }
 });
 
