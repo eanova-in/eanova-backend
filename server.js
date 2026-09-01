@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 require('dotenv').config();
 
 const User = require('./User');
@@ -17,45 +17,19 @@ mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully!'))
   .catch(err => console.log('DB Error:', err));
 
+// Resend Client
+const resend = new Resend(process.env.RESEND_API_KEY);
+
 // মেমোরিতে সাময়িকভাবে OTP ধরে রাখার অবজেক্ট
 const otpStore = {};
 const resetOtpStore = {};
 
 // ============================================================
-// ✅ Gmail Transporter – IPv4 ফোর্স + টাইমআউট বাড়ানো
-// ============================================================
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false, // TLS
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  },
-  family: 4,                // ← IPv4 বাধ্য
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 10000,
-  pool: true,
-  maxConnections: 1,
-  rateLimit: 5
-});
-
-// ট্রান্সপোর্টার ভেরিফাই (ডিবাগ)
-transporter.verify(function(error, success) {
-  if (error) {
-    console.log('SMTP connection error:', error);
-  } else {
-    console.log('SMTP server is ready to send emails');
-  }
-});
-
-// ============================================================
-// OTP ইমেইল পাঠানোর ফাংশন
+// OTP ইমেইল পাঠানোর ফাংশন (Resend)
 // ============================================================
 async function sendOtpEmail(email, otp, subjectLine) {
-  const mailOptions = {
-    from: `"Eanova Support" <${process.env.EMAIL_USER}>`,
+  const { data, error } = await resend.emails.send({
+    from: 'Eanova <noreply@eanova.in>', // আপনার ভেরিফাই করা ডোমেইন
     to: email,
     subject: subjectLine,
     html: `
@@ -66,16 +40,13 @@ async function sendOtpEmail(email, otp, subjectLine) {
         <p>This code will expire in 5 minutes.</p>
       </div>
     `
-  };
-  
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('Email sent successfully to:', email);
-    return info;
-  } catch (err) {
-    console.error('SendMail error:', err);
-    throw err;
+  });
+
+  if (error) {
+    console.error('Resend error:', error);
+    throw new Error('Failed to send email');
   }
+  return data;
 }
 
 // ============================================================
