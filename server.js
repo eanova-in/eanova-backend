@@ -17,17 +17,30 @@ mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('MongoDB Connected Successfully!'))
   .catch(err => console.log('DB Error:', err));
 
-// মেমোরিতে সাময়িকভাবে OTP ধরে রাখার অবজেক্ট (signup OTP + forgot-password OTP আলাদা key দিয়ে)
+// মেমোরিতে সাময়িকভাবে OTP ধরে রাখার অবজেক্ট
 const otpStore = {};
 const resetOtpStore = {};
 
-// Transporter তৈরি (Gmail App Password দিয়ে)
+// ============================================================
+// NODEMAILER – IPv4 ফোর্স + টাইমআউট বাড়ানো
+// ============================================================
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false, // TLS ব্যবহার
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
-  }
+  },
+  tls: {
+    rejectUnauthorized: false,
+    ciphers: 'SSLv3'
+  },
+  connectionTimeout: 30000,  // 30 সেকেন্ড
+  greetingTimeout: 30000,
+  socketTimeout: 30000,
+  // Node.js কে IPv4 ব্যবহার করতে বাধ্য করা (IPv6 ব্লক এড়াতে)
+  family: 4
 });
 
 function sendOtpEmail(email, otp, subjectLine) {
@@ -127,9 +140,6 @@ app.post('/api/login', async (req, res) => {
         email: user.email,
         region: user.region
       },
-      // Returned directly on login too (not just via /api/user-data) so the
-      // dashboard is correct on first paint after logging in on a new device,
-      // without waiting for the follow-up sync call.
       clients: user.clients || [],
       subscriptionActive: user.subscriptionActive || false,
       activePlan: user.activePlan || null,
@@ -200,20 +210,11 @@ app.post('/api/reset-password', async (req, res) => {
 // ৬. ইউজারের ক্লায়েন্ট লিস্ট ও সাবস্ক্রিপশন ডাটা ফেচ করা
 // ============================================================
 app.get('/api/user-data', async (req, res) => {
-  // This response must never be cached by the browser. Without this header,
-  // the browser was free to reuse a cached copy from before a purchase and
-  // return it as an HTTP 304 — which is exactly what was making a plan
-  // that saved correctly on the server still disappear on refresh: the
-  // fresh request never actually reached this handler, so even correct
-  // server-side data never had a chance to reach the page.
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   try {
     const { email } = req.query;
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: 'User not found' });
-
-    // TEMPORARY DIAGNOSTIC — same purpose as the one in /api/update-profile.
-    console.log('[DIAG user-data] email queried:', email, '| subscriptionActive found:', user.subscriptionActive, '| _id:', user._id.toString());
 
     res.json({
       user: {
@@ -236,22 +237,12 @@ app.get('/api/user-data', async (req, res) => {
 
 // ============================================================
 // ৭. প্রোফাইল / সাবস্ক্রিপশন আপডেট
-//    (প্ল্যান কেনা, প্রোফাইল ছবি বদলানো — এই দুটোই এই একটা রুট দিয়ে হয়)
 // ============================================================
 app.post('/api/update-profile', async (req, res) => {
   try {
     const { email, subscriptionActive, activePlan, subscriptionExpiry, hasPaidBefore, profilePic, name, firm } = req.body;
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
-    // Load the document and set fields directly, then call .save().
-    // findOneAndUpdate() with a plain update object was silently not
-    // persisting subscriptionActive/activePlan/subscriptionExpiry even
-    // though it returned 200 and even echoed back the correct values in
-    // its own response — the write simply wasn't landing. Loading the
-    // document, assigning fields on it directly, and calling .save()
-    // is a completely different Mongoose code path (goes through the
-    // document's own change-tracking rather than an update-query
-    // builder) and sidesteps whatever was swallowing the update.
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
@@ -269,15 +260,9 @@ app.post('/api/update-profile', async (req, res) => {
 
     await user.save();
 
-    // Immediately re-read from the database (not from the in-memory
-    // object just saved) as a hard verification that the write actually
-    // landed. If it didn't, fail loudly with a 500 instead of returning
-    // a false "success" — the frontend's retry logic (see payBtn
-    // handler) already knows how to handle a failed save safely, but it
-    // can only do that if a real failure is reported as one.
     const verify = await User.findOne({ email });
     if (!verify || (typeof subscriptionActive === 'boolean' && verify.subscriptionActive !== subscriptionActive)) {
-      console.error('[update-profile] Save verification FAILED for', email, '— wrote', subscriptionActive, 'but re-read got', verify && verify.subscriptionActive);
+      console.error('[update-profile] Save verification FAILED for', email);
       return res.status(500).json({ message: 'Save did not persist — please try again' });
     }
 
@@ -303,10 +288,6 @@ app.post('/api/update-profile', async (req, res) => {
 
 // ============================================================
 // ৮. ক্লায়েন্ট সেভ/আপডেট
-//    আগের ভার্সনে এটা সবসময় $push করত, ফলে reconciliation চালানোর পর
-//    একই client-এর জন্য আবার call করলে সেই client duplicate হয়ে array-তে
-//    যোগ হত। এখন: id মিলে গেলে সেই client-কে replace করে, না মিললে নতুন
-//    client হিসেবে push করে।
 // ============================================================
 app.post('/api/save-client', async (req, res) => {
   try {
@@ -334,8 +315,6 @@ app.post('/api/save-client', async (req, res) => {
 
 // ============================================================
 // ৯. ফ্রি-ট্রায়াল দৈনিক reconciliation সীমা চেক
-//    ফ্রি ট্রায়ালে থাকা ইউজার প্রতি ক্যালেন্ডার দিনে একবার reconciliation
-//    চালাতে পারবে। পেইড সাবস্ক্রিপশন থাকলে কোনো সীমা নেই।
 // ============================================================
 app.post('/api/check-reconciliation-limit', async (req, res) => {
   try {
@@ -349,7 +328,7 @@ app.post('/api/check-reconciliation-limit', async (req, res) => {
       return res.json({ allowed: true, reason: 'paid' });
     }
 
-    const today = new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+    const today = new Date().toISOString().slice(0, 10);
     if (user.lastReconciliationDate === today) {
       return res.json({ allowed: false, reason: 'daily-limit-reached' });
     }
@@ -359,9 +338,6 @@ app.post('/api/check-reconciliation-limit', async (req, res) => {
     res.json({ allowed: true, reason: 'trial-daily-slot' });
   } catch (err) {
     console.error('Error checking reconciliation limit:', err);
-    // Fail open rather than blocking a paying customer's workflow over a
-    // transient server error — but this only affects trial accounts, since
-    // paid accounts return earlier above.
     res.json({ allowed: true, reason: 'check-failed-open' });
   }
 });
