@@ -3,9 +3,9 @@
   "version": "1.0.1",
   "private": true,
   "description": "EANOVA backend API — Express + MongoDB (Mongoose)",
-  "main": "server.js",
+  "main": "server-1.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server-1.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
