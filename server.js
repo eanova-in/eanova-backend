@@ -447,6 +447,7 @@ app.post('/api/update-profile', requireAuth, ensureOwnEmail, async (req, res) =>
 
     const user = await User.findOne({ email: req.userEmail });
     if (!user) return res.status(404).json({ message: 'User not found' });
+    const wasSubscriptionActiveBefore = user.subscriptionActive;
 
     // --- সাবস্ক্রিপশন/প্ল্যান পরিবর্তন (demo checkout থেকে আসে) ---
     // এখানে শুধু whitelisted plan নাম গ্রহণযোগ্য; দাম ও মেয়াদ
@@ -485,16 +486,47 @@ app.post('/api/update-profile', requireAuth, ensureOwnEmail, async (req, res) =>
     if (name !== undefined) user.name = String(name).slice(0, 200);
     if (firm !== undefined) user.firm = String(firm).slice(0, 200);
 
-    user.markModified('subscriptionActive');
-    user.markModified('activePlan');
-    user.markModified('subscriptionExpiry');
+    // markModified() only ever called when `plan` was actually part of this
+    // request — calling it unconditionally on every profile-picture-only or
+    // name-only update told Mongoose to force-rewrite subscriptionActive /
+    // activePlan / subscriptionExpiry on saves that never touched them. That
+    // is/was a real risk: it meant a plain "update my profile photo" call
+    // could re-persist whatever those three fields happened to hold in this
+    // in-memory `user` object at that moment — normally harmless, but with
+    // zero verification catching it if anything upstream ever left them
+    // stale (the verification block below only checks subscriptionActive
+    // when `plan !== undefined`, precisely because this route was never
+    // meant to touch those fields on a non-plan update at all).
+    if (plan !== undefined) {
+      user.markModified('subscriptionActive');
+      user.markModified('activePlan');
+      user.markModified('subscriptionExpiry');
+    }
 
     await user.save();
 
     const verify = await User.findOne({ email: req.userEmail });
-    if (!verify || (plan !== undefined && verify.subscriptionActive !== true)) {
-      console.error('[update-profile] Save verification FAILED for', req.userEmail);
+    if (!verify) {
+      console.error('[update-profile] Save verification FAILED (user vanished) for', req.userEmail);
       return res.status(500).json({ message: 'Save did not persist — please try again' });
+    }
+    if (plan !== undefined && verify.subscriptionActive !== true) {
+      console.error('[update-profile] Save verification FAILED (plan purchase did not persist) for', req.userEmail);
+      return res.status(500).json({ message: 'Save did not persist — please try again' });
+    }
+    // Safety net for every update, not just plan purchases: if this request
+    // did NOT touch the plan, subscriptionActive on the freshly-read
+    // document must be unchanged from what it was before this request
+    // started — a profile-picture or name update should never be able to
+    // silently flip a paid plan off. This is the check that would have
+    // caught the bug above before it ever reached a real user.
+    if (plan === undefined && wasSubscriptionActiveBefore !== verify.subscriptionActive) {
+      console.error('[update-profile] BLOCKED an unintended subscriptionActive change for', req.userEmail, '— was', wasSubscriptionActiveBefore, 'now', verify.subscriptionActive);
+      // Restore it rather than just erroring out, since the rest of this
+      // update (e.g. the profile picture) is still valid and shouldn't be
+      // thrown away over this.
+      verify.subscriptionActive = wasSubscriptionActiveBefore;
+      await verify.save();
     }
 
     res.json({
