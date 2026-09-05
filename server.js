@@ -185,7 +185,7 @@ function ensureOwnEmail(req, res, next) {
 // ============================================================
 app.post('/api/send-otp', otpRequestLimiter, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
     const existingUser = await User.findOne({ email });
@@ -207,7 +207,8 @@ app.post('/api/send-otp', otpRequestLimiter, async (req, res) => {
 // ============================================================
 app.post('/api/verify-otp', otpRequestLimiter, async (req, res) => {
   try {
-    const { name, firm, email, password, region, otp } = req.body;
+    const { name, firm, password, region, otp } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
     if (!name || !firm || !email || !password || !otp) {
       return res.status(400).json({ message: 'All fields are required' });
     }
@@ -256,35 +257,54 @@ app.post('/api/verify-otp', otpRequestLimiter, async (req, res) => {
 // ============================================================
 app.post('/api/login', loginLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const password = req.body.password;
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
 
     const user = await User.findOne({ email });
-    if (!user) return res.status(400).json({ message: 'Invalid credentials' });
+    // Backward compatibility: accounts created before this fix may have
+    // their email stored with different casing (MongoDB's unique index is
+    // case-sensitive by default, and nothing normalized it before now).
+    // This was the actual reason a plan bought on one device could look
+    // completely invisible when logging in with the same Gmail address
+    // typed with different capitalization on another device — they weren't
+    // reading the same account at all, from the database's point of view.
+    // A case-insensitive fallback here finds that older account, and then
+    // permanently normalizes its stored email to lowercase so every future
+    // login goes straight through the fast, exact-match path above.
+    let foundUser = user;
+    if (!foundUser) {
+      foundUser = await User.findOne({ email: new RegExp('^' + email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'i') });
+      if (foundUser && foundUser.email !== email) {
+        foundUser.email = email;
+        await foundUser.save();
+      }
+    }
+    if (!foundUser) return res.status(400).json({ message: 'Invalid credentials' });
 
-    const isMatch = await bcrypt.compare(password, user.password);
+    const isMatch = await bcrypt.compare(password, foundUser.password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
-    const token = signToken(user);
-    const accountCreatedAt = await ensureAccountCreatedAt(user);
+    const token = signToken(foundUser);
+    const accountCreatedAt = await ensureAccountCreatedAt(foundUser);
     const trial = trialInfo(accountCreatedAt);
 
     res.json({
       token,
       user: {
-        name: user.name,
-        firm: user.firm,
-        email: user.email,
-        region: user.region
+        name: foundUser.name,
+        firm: foundUser.firm,
+        email: foundUser.email,
+        region: foundUser.region
       },
-      clients: user.clients || [],
-      subscriptionActive: user.subscriptionActive || false,
-      activePlan: user.activePlan || null,
-      subscriptionExpiry: user.subscriptionExpiry || null,
-      profilePic: user.profilePic || '',
-      lastReceipt: user.lastReceipt || null,
+      clients: foundUser.clients || [],
+      subscriptionActive: foundUser.subscriptionActive || false,
+      activePlan: foundUser.activePlan || null,
+      subscriptionExpiry: foundUser.subscriptionExpiry || null,
+      profilePic: foundUser.profilePic || '',
+      lastReceipt: foundUser.lastReceipt || null,
       accountCreatedAt: accountCreatedAt,
       trialActive: trial.trialActive,
       trialDaysRemaining: trial.daysRemaining,
@@ -301,7 +321,7 @@ app.post('/api/login', loginLimiter, async (req, res) => {
 // ============================================================
 app.post('/api/forgot-password-otp', resetLimiter, async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
     const user = await User.findOne({ email });
@@ -326,7 +346,8 @@ app.post('/api/forgot-password-otp', resetLimiter, async (req, res) => {
 // ============================================================
 app.post('/api/reset-password', resetLimiter, async (req, res) => {
   try {
-    const { email, otp, newPassword } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const { otp, newPassword } = req.body;
     if (!email || !otp || !newPassword) {
       return res.status(400).json({ message: 'Email, code and new password are all required' });
     }
