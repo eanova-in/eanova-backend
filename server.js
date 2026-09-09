@@ -290,6 +290,105 @@ app.post('/api/login', loginLimiter, async (req, res) => {
 });
 
 // ============================================================
+// ৩.৫ — GOOGLE SIGN-IN (নতুন, সম্পূর্ণ আলাদা রুট — উপরের OTP-ভিত্তিক
+//        signup/login/forgot-password এর একটা লাইনও এখানে ছোঁয়া হয়নি)
+//
+// ফ্রন্টএন্ড থেকে Google Identity Services যে "credential" (একটা ID
+// token / JWT) পাঠায়, সেটা এখানে সরাসরি Google-এর নিজস্ব tokeninfo
+// endpoint দিয়ে verify করা হয় — কোনো নতুন npm প্যাকেজ (google-auth-library
+// ইত্যাদি) ইনস্টল করার দরকার নেই, Node-এর built-in fetch দিয়েই হয়।
+//
+// GOOGLE_CLIENT_ID env variable যোগ করা must — Render-এ Environment
+// ট্যাবে গিয়ে বসিয়ে দিতে হবে (মান: আপনার Google Cloud Console-এর
+// OAuth Client ID, যেমন 263544387024-....apps.googleusercontent.com)।
+// এই ভ্যারিয়েবল ছাড়া রুটটা নিরাপদে সবসময় 500 দেবে, কখনো ভুল করে
+// কারো টোকেন গ্রহণ করবে না।
+// ============================================================
+app.post('/api/google-login', loginLimiter, async (req, res) => {
+  try {
+    if (!process.env.GOOGLE_CLIENT_ID) {
+      console.error('GOOGLE_CLIENT_ID env variable is not set — refusing Google sign-in.');
+      return res.status(500).json({ message: 'Google sign-in is not configured on the server yet.' });
+    }
+
+    const { credential } = req.body;
+    if (!credential) return res.status(400).json({ message: 'Google credential is required' });
+
+    // Google নিজেই এই টোকেনটা যাচাই করে দেয় — স্বাক্ষর (signature),
+    // মেয়াদ (expiry), এবং কোন অ্যাপের জন্য ইস্যু হয়েছে সব চেক করা থাকে।
+    // আমরা শুধু নিশ্চিত করি এটা আমাদেরই Client ID-র জন্য ইস্যু হয়েছে,
+    // অন্য কোনো Google app-এর টোকেন যেন গ্রহণ না হয়।
+    let payload;
+    try {
+      const verifyRes = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential));
+      if (!verifyRes.ok) {
+        return res.status(401).json({ message: 'Invalid or expired Google credential' });
+      }
+      payload = await verifyRes.json();
+    } catch (verifyErr) {
+      console.error('Google tokeninfo verification failed:', verifyErr.message || verifyErr);
+      return res.status(502).json({ message: 'Could not verify Google credential right now. Please try again.' });
+    }
+
+    if (payload.aud !== process.env.GOOGLE_CLIENT_ID) {
+      return res.status(401).json({ message: 'Invalid Google credential' });
+    }
+    if (payload.email_verified !== 'true' && payload.email_verified !== true) {
+      return res.status(401).json({ message: 'This Google account\'s email is not verified' });
+    }
+    if (!payload.email) {
+      return res.status(400).json({ message: 'Google did not provide an email address' });
+    }
+
+    const email = payload.email;
+    const googleId = payload.sub;
+
+    let user = await User.findOne({ email });
+    if (!user) {
+      // একদম নতুন — Google নিজেই ইমেইল ভেরিফাই করে দিয়েছে, তাই আলাদা
+      // OTP লাগবে না। firm name খালি রাখা হলো, ইউজার পরে প্রোফাইল থেকে
+      // ভরে নিতে পারবে — password নেই কারণ এই একাউন্ট শুধু Google দিয়েই
+      // লগইন করবে।
+      user = new User({
+        name: payload.name || email.split('@')[0],
+        firm: '',
+        email,
+        googleId,
+        region: 'in',
+        profilePic: payload.picture || ''
+      });
+      await user.save();
+    } else if (!user.googleId) {
+      // আগে থেকেই ইমেইল/পাসওয়ার্ড দিয়ে account ছিল — এই Google
+      // একাউন্টটা তার সাথে link করে দেওয়া হলো, existing password/data
+      // কিছুই বদলানো হয় না।
+      user.googleId = googleId;
+      await user.save();
+    }
+
+    const token = signToken(user);
+    res.json({
+      token,
+      user: {
+        name: user.name,
+        firm: user.firm,
+        email: user.email,
+        region: user.region
+      },
+      clients: user.clients || [],
+      subscriptionActive: user.subscriptionActive || false,
+      activePlan: user.activePlan || null,
+      subscriptionExpiry: user.subscriptionExpiry || null,
+      profilePic: user.profilePic || '',
+      message: 'Login successful!'
+    });
+  } catch (error) {
+    console.error('Google login error:', error.message || error);
+    res.status(500).json({ message: 'Server error during Google login' });
+  }
+});
+
+// ============================================================
 // ৪. FORGOT PASSWORD — ধাপ ১: রিসেট OTP পাঠানো
 // ============================================================
 app.post('/api/forgot-password-otp', resetLimiter, async (req, res) => {

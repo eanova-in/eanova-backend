@@ -4,7 +4,12 @@ const userSchema = new mongoose.Schema({
   name: { type: String },
   firm: { type: String },
   email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
+  // Google দিয়ে সাইন-ইন করা একাউন্টের কোনো password থাকে না (Google-ই
+  // ইমেইল ভেরিফাই করে দেয়, তাই দরকারও নেই) — তাই password এখন শুধু
+  // তখনই required, যখন googleId সেট করা নেই। সাধারণ email/OTP signup-এর
+  // জন্য আগের মতোই password বাধ্যতামূলক থাকছে, কিছুই বদলায়নি সেখানে।
+  password: { type: String, required: function () { return !this.googleId; } },
+  googleId: { type: String, default: null },
   region: { type: String, default: 'in' },
 
   // Subscription — all three of these are set together whenever a plan is
