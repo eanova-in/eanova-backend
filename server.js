@@ -495,6 +495,161 @@ const PLAN_DURATIONS_MS = {
 };
 
 // ============================================================
+// ৬.৫ — RAZORPAY আসল পেমেন্ট (নতুন, সম্পূর্ণ আলাদা রুট জোড়া —
+//        update-profile রুটের একটা লাইনও এখানে ছোঁয়া হয়নি; শুধু
+//        payment verify হওয়ার পর ওই রুটটা যা করে (subscription চালু),
+//        ঠিক সেই একই কাজ এখানে আলাদাভাবে করা হয়েছে)
+//
+// দাম ও GST সম্পূর্ণ সার্ভার-সাইডে ফিক্সড, ক্লায়েন্ট থেকে amount
+// পাঠিয়ে কম দামে কেনা যাবে না — শুধু plan-এর নাম পাঠানো হয়, দাম
+// এখান থেকেই হিসাব হয় (frontend-এর currentPlanPrice()-এর 'in'
+// region-এর সাথে হুবহু মেলানো)।
+//
+// RAZORPAY_KEY_ID এবং RAZORPAY_KEY_SECRET env variable দুটো Render-এ
+// বসাতে হবে — না থাকলে এই রুট দুটো নিরাপদে error দেবে, কখনো ভুল করে
+// বিনামূল্যে subscription চালু করবে না।
+// ============================================================
+const PLAN_BASE_INR = {
+  first: 99,
+  monthly: 199,
+  annual: 1800
+};
+const GST_RATE = 0.18;
+
+app.post('/api/razorpay/create-order', requireAuth, async (req, res) => {
+  try {
+    if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+      console.error('RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET env variable(s) not set — refusing to create order.');
+      return res.status(500).json({ message: 'Payments are not configured on the server yet.' });
+    }
+    const { plan } = req.body;
+    if (!PLAN_BASE_INR[plan]) {
+      return res.status(400).json({ message: 'Invalid plan selected' });
+    }
+
+    const user = await User.findOne({ email: req.userEmail });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const baseAmount = PLAN_BASE_INR[plan];
+    const gstAmount = Math.round(baseAmount * GST_RATE * 100) / 100;
+    const totalAmount = Math.round((baseAmount + gstAmount) * 100) / 100;
+    const amountInPaise = Math.round(totalAmount * 100);
+
+    const authHeader = 'Basic ' + Buffer.from(process.env.RAZORPAY_KEY_ID + ':' + process.env.RAZORPAY_KEY_SECRET).toString('base64');
+    let order;
+    try {
+      const orderRes = await fetch('https://api.razorpay.com/v1/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': authHeader },
+        body: JSON.stringify({
+          amount: amountInPaise,
+          currency: 'INR',
+          // Receipt is just a reference string for your own records — kept
+          // short and free of personal data (no full email) since it may
+          // show up in Razorpay's dashboard/exports.
+          receipt: 'eanova_' + req.userId + '_' + Date.now(),
+          notes: { plan: plan, userId: req.userId }
+        })
+      });
+      if (!orderRes.ok) {
+        const errBody = await orderRes.text();
+        console.error('Razorpay order creation failed:', errBody);
+        return res.status(502).json({ message: 'Could not start payment right now. Please try again.' });
+      }
+      order = await orderRes.json();
+    } catch (orderErr) {
+      console.error('Razorpay order request failed:', orderErr.message || orderErr);
+      return res.status(502).json({ message: 'Could not reach the payment provider. Please try again.' });
+    }
+
+    res.json({
+      orderId: order.id,
+      amount: amountInPaise,
+      currency: 'INR',
+      keyId: process.env.RAZORPAY_KEY_ID,
+      name: user.name || '',
+      email: user.email
+    });
+  } catch (error) {
+    console.error('Create order error:', error.message || error);
+    res.status(500).json({ message: 'Server error while starting payment' });
+  }
+});
+
+app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
+  try {
+    if (!process.env.RAZORPAY_KEY_SECRET) {
+      console.error('RAZORPAY_KEY_SECRET env variable not set — refusing to verify payment.');
+      return res.status(500).json({ message: 'Payments are not configured on the server yet.' });
+    }
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ message: 'Missing payment details' });
+    }
+    if (!PLAN_DURATIONS_MS[plan]) {
+      return res.status(400).json({ message: 'Invalid plan selected' });
+    }
+
+    // Razorpay-র নিজস্ব নিয়ম: HMAC-SHA256("order_id|payment_id", key_secret)
+    // — এটা মিললেই বোঝা যায় রেসপন্সটা সত্যিই Razorpay পাঠিয়েছে, কেউ
+    // browser console থেকে ভুয়া "success" বানিয়ে পাঠায়নি।
+    const expectedSignature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + '|' + razorpay_payment_id)
+      .digest('hex');
+
+    const sigBuffer = Buffer.from(razorpay_signature, 'utf8');
+    const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
+    const signatureValid = sigBuffer.length === expectedBuffer.length &&
+      crypto.timingSafeEqual(sigBuffer, expectedBuffer);
+
+    if (!signatureValid) {
+      console.error('[razorpay/verify-payment] Signature mismatch for', req.userEmail, 'order', razorpay_order_id);
+      return res.status(400).json({ message: 'Payment verification failed. If money was deducted, please contact support.' });
+    }
+
+    const user = await User.findOne({ email: req.userEmail });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // ঠিক update-profile রুট যা করে সেই একই activation — এখানে আলাদাভাবে
+    // লেখা হলো যাতে সেই existing রুটটা একদম অক্ষত থাকে।
+    user.subscriptionActive = true;
+    user.activePlan = plan;
+    user.subscriptionExpiry = Date.now() + PLAN_DURATIONS_MS[plan];
+    user.hasPaidBefore = true;
+    user.markModified('subscriptionActive');
+    user.markModified('activePlan');
+    user.markModified('subscriptionExpiry');
+    await user.save();
+
+    const verify = await User.findOne({ email: req.userEmail });
+    if (!verify || verify.subscriptionActive !== true) {
+      console.error('[razorpay/verify-payment] Save verification FAILED for', req.userEmail);
+      return res.status(500).json({ message: 'Payment verified but activation failed to save — please contact support with your payment ID: ' + razorpay_payment_id });
+    }
+
+    res.json({
+      message: 'Payment verified and subscription activated!',
+      razorpayPaymentId: razorpay_payment_id,
+      user: {
+        name: verify.name,
+        firm: verify.firm,
+        email: verify.email,
+        region: verify.region,
+        subscriptionActive: verify.subscriptionActive,
+        activePlan: verify.activePlan,
+        subscriptionExpiry: verify.subscriptionExpiry,
+        hasPaidBefore: verify.hasPaidBefore,
+        profilePic: verify.profilePic
+      }
+    });
+  } catch (error) {
+    console.error('Verify payment error:', error.message || error);
+    res.status(500).json({ message: 'Server error while verifying payment' });
+  }
+});
+
+// ============================================================
 // ৭. প্রোফাইল / সাবস্ক্রিপশন আপডেট
 //    (এখন লগইন টোকেন আবশ্যক + নিজের একাউন্ট ছাড়া বদলানো যাবে না;
 //     subscriptionActive সরাসরি ক্লায়েন্ট থেকে "true" পাঠিয়ে সেট
