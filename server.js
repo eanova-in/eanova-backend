@@ -949,10 +949,31 @@ app.get('/api/referral/info', requireAuth, async (req, res) => {
     }
 
     const points = summarizePoints(user);
+
+    // History-তে যে কেউ এই referral code দিয়ে সাইন-আপ করেছে তার নাম +
+    // স্ট্যাটাস দেখানো হয় — শুধু যারা কিনেছে তারা না, যারা শুধু একাউন্ট
+    // খুলেছে কিন্তু এখনো কোনো প্ল্যান কেনেনি তারাও (pending হিসেবে)।
+    const referredDocs = await User.find({ referredBy: user.referralCode })
+      .select('name email hasPaidBefore');
+    const earnedByEmail = {};
+    (user.pointsLedger || []).forEach(function (e) {
+      if (e.type === 'earn' && e.status !== 'reversed') {
+        earnedByEmail[e.buyerEmail] = (earnedByEmail[e.buyerEmail] || 0) + e.amount;
+      }
+    });
+    const referredAccounts = referredDocs.map(function (d) {
+      return {
+        name: d.name || maskEmailServer(d.email),
+        status: d.hasPaidBefore ? 'success' : 'pending',
+        totalEarned: Math.round((earnedByEmail[d.email] || 0) * 100) / 100
+      };
+    });
+
     res.json({
       referralCode: user.referralCode,
       referralLink: 'https://www.eanova.in/?ref=' + user.referralCode,
       points: points,
+      referredAccounts: referredAccounts,
       minWithdrawalInr: MIN_WITHDRAWAL_INR,
       withdrawalRequests: (user.withdrawalRequests || [])
         .slice()
