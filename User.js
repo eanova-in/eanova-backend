@@ -32,7 +32,19 @@ const userSchema = new mongoose.Schema({
   // reconciliation was run, so it resets naturally at midnight without a cron job.
   lastReconciliationDate: { type: String, default: null },
 
-  clients: { type: Array, default: [] }
+  clients: { type: Array, default: [] },
+
+  // Referral program. referralCode is this user's own shareable code
+  // (assigned once, at account creation, for every account — random and
+  // non-sequential so codes can't be guessed/enumerated). referredBy is
+  // the code THEY signed up with, if any — set once at creation and never
+  // changed afterward, so it can't be gamed by editing it post-signup.
+  referralCode: { type: String, unique: true, sparse: true, index: true },
+  referredBy: { type: String, default: null },
+  // Set when the user clicks "Request Withdrawal" while eligible (balance
+  // >= ₹100) — just a marker so the founder can find pending requests;
+  // actual payout is manual (see the withdraw-request route's response).
+  referralWithdrawalRequestedAt: { type: Number, default: null }
 });
 
 module.exports = mongoose.model('User', userSchema);

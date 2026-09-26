@@ -10,6 +10,30 @@ const { Resend } = require('resend');
 require('dotenv').config();
 
 const User = require('./User');
+const ReferralCommission = require('./ReferralCommission');
+const WithdrawalRequest = require('./WithdrawalRequest');
+
+// ============================================================
+// রেফারেল প্রোগ্রাম — হেল্পার
+// ============================================================
+const REFERRAL_COMMISSION_RATE = 0.08;   // referred user-এর pre-GST প্ল্যান amount-এর 8%
+const REFERRAL_UNLOCK_MS = 7 * 24 * 60 * 60 * 1000; // ৭ দিন লক থাকবে, তারপর withdraw করা যাবে
+const REFERRAL_MIN_WITHDRAW = 100; // ₹100
+
+function generateReferralCodeCandidate() {
+  // ছোট, সহজে টাইপ/শেয়ার করা যায় এমন কোড — কিন্তু guess করা কঠিন হওয়ার
+  // জন্য যথেষ্ট এলোমেলো (৮ অক্ষর, base36, ~41 বিট এনট্রপি)।
+  return crypto.randomBytes(6).toString('base64url').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toUpperCase();
+}
+async function generateUniqueReferralCode() {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = generateReferralCodeCandidate();
+    const exists = await User.findOne({ referralCode: candidate }).select('_id');
+    if (!exists) return candidate;
+  }
+  // অত্যন্ত অসম্ভব (৮ বারেও collision) — timestamp যোগ করে নিশ্চিত ইউনিক করা
+  return generateReferralCodeCandidate() + Date.now().toString(36).slice(-4).toUpperCase();
+}
 
 // ============================================================
 // আবশ্যিক এনভায়রনমেন্ট ভেরিয়েবল যাচাই — কোনোটা মিসিং থাকলে
@@ -207,7 +231,7 @@ app.post('/api/send-otp', otpRequestLimiter, async (req, res) => {
 // ============================================================
 app.post('/api/verify-otp', otpRequestLimiter, async (req, res) => {
   try {
-    const { name, firm, email, password, region, otp } = req.body;
+    const { name, firm, email, password, region, otp, ref } = req.body;
     if (!name || !firm || !email || !password || !otp) {
       return res.status(400).json({ message: 'All fields are required' });
     }
@@ -234,12 +258,26 @@ app.post('/api/verify-otp', otpRequestLimiter, async (req, res) => {
     delete otpStore[email];
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // রেফারেল — কোড সত্যিই কোনো existing user-এর হলেই, এবং কারো নিজের
+    // ইমেইলের সাথে না মিললেই (trivial self-referral আটকানো) সেট হবে।
+    // referredBy একবার এখানেই সেট হয়, পরে আর কখনো বদলানো যায় না।
+    let referredByCode = null;
+    if (ref && typeof ref === 'string') {
+      const referrer = await User.findOne({ referralCode: ref.trim().toUpperCase() }).select('_id email referralCode');
+      if (referrer && referrer.email.toLowerCase() !== email.toLowerCase()) {
+        referredByCode = referrer.referralCode;
+      }
+    }
+    const myReferralCode = await generateUniqueReferralCode();
+
     const newUser = new User({
       name,
       firm,
       email,
       password: hashedPassword,
-      region: (region === 'intl') ? 'intl' : 'in'
+      region: (region === 'intl') ? 'intl' : 'in',
+      referralCode: myReferralCode,
+      referredBy: referredByCode
     });
 
     await newUser.save();
@@ -265,6 +303,14 @@ app.post('/api/login', loginLimiter, async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+
+    // Backfill: রেফারেল ফিচার আসার আগে যাদের account হয়েছিল, তাদের
+    // referralCode ছিল না — পরের যেকোনো login-এই একবার lazily বানিয়ে
+    // দেওয়া হচ্ছে, আলাদা migration script ছাড়াই।
+    if (!user.referralCode) {
+      user.referralCode = await generateUniqueReferralCode();
+      await user.save();
+    }
 
     const token = signToken(user);
 
@@ -311,7 +357,7 @@ app.post('/api/google-login', loginLimiter, async (req, res) => {
       return res.status(500).json({ message: 'Google sign-in is not configured on the server yet.' });
     }
 
-    const { credential } = req.body;
+    const { credential, ref } = req.body;
     if (!credential) return res.status(400).json({ message: 'Google credential is required' });
 
     // Google নিজেই এই টোকেনটা যাচাই করে দেয় — স্বাক্ষর (signature),
@@ -349,13 +395,23 @@ app.post('/api/google-login', loginLimiter, async (req, res) => {
       // OTP লাগবে না। firm name খালি রাখা হলো, ইউজার পরে প্রোফাইল থেকে
       // ভরে নিতে পারবে — password নেই কারণ এই একাউন্ট শুধু Google দিয়েই
       // লগইন করবে।
+      let referredByCode = null;
+      if (ref && typeof ref === 'string') {
+        const referrer = await User.findOne({ referralCode: ref.trim().toUpperCase() }).select('_id email referralCode');
+        if (referrer && referrer.email.toLowerCase() !== email.toLowerCase()) {
+          referredByCode = referrer.referralCode;
+        }
+      }
+      const myReferralCode = await generateUniqueReferralCode();
       user = new User({
         name: payload.name || email.split('@')[0],
         firm: '',
         email,
         googleId,
         region: 'in',
-        profilePic: payload.picture || ''
+        profilePic: payload.picture || '',
+        referralCode: myReferralCode,
+        referredBy: referredByCode
       });
       await user.save();
     } else if (!user.googleId) {
@@ -363,6 +419,14 @@ app.post('/api/google-login', loginLimiter, async (req, res) => {
       // একাউন্টটা তার সাথে link করে দেওয়া হলো, existing password/data
       // কিছুই বদলানো হয় না।
       user.googleId = googleId;
+      await user.save();
+    }
+
+    // Backfill: রেফারেল ফিচার আসার আগে যাদের account হয়েছিল, তাদের
+    // referralCode ছিল না — পরের যেকোনো login-এই একবার lazily বানিয়ে
+    // দেওয়া হচ্ছে, আলাদা migration script ছাড়াই।
+    if (!user.referralCode) {
+      user.referralCode = await generateUniqueReferralCode();
       await user.save();
     }
 
@@ -611,6 +675,10 @@ app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
     const user = await User.findOne({ email: req.userEmail });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
+    // রেফারেল কমিশন শুধু কারো *প্রথম* সফল পেমেন্টেই দেওয়া হয় — তাই এই
+    // flag-টা overwrite করার আগেই capture করে রাখা হচ্ছে।
+    const isFirstEverPurchase = !user.hasPaidBefore;
+
     // ঠিক update-profile রুট যা করে সেই একই activation — এখানে আলাদাভাবে
     // লেখা হলো যাতে সেই existing রুটটা একদম অক্ষত থাকে।
     user.subscriptionActive = true;
@@ -626,6 +694,42 @@ app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
     if (!verify || verify.subscriptionActive !== true) {
       console.error('[razorpay/verify-payment] Save verification FAILED for', req.userEmail);
       return res.status(500).json({ message: 'Payment verified but activation failed to save — please contact support with your payment ID: ' + razorpay_payment_id });
+    }
+
+    // রেফারেল কমিশন — শুধুমাত্র (ক) এটা এই user-এর জীবনের প্রথম পেমেন্ট
+    // হলে, এবং (খ) সে কারো রেফারেল লিংক দিয়ে account খুলেছিল। কখনো
+    // payment-এর মূল response-কে ব্যর্থ হতে দেওয়া হয় না এই কারণে — টাকা
+    // তো সত্যিই কাটা হয়ে গেছে, referral-crediting ব্যর্থ হলে সেটা শুধু
+    // log হবে, customer কখনো এর জন্য আটকে থাকবে না।
+    if (isFirstEverPurchase && verify.referredBy) {
+      try {
+        const referrer = await User.findOne({ referralCode: verify.referredBy }).select('_id');
+        if (referrer) {
+          const baseAmount = PLAN_BASE_INR[plan] || 0;
+          const commissionAmount = Math.round(baseAmount * REFERRAL_COMMISSION_RATE * 100) / 100;
+          if (commissionAmount > 0) {
+            await ReferralCommission.create({
+              referrerId: referrer._id,
+              referredUserId: verify._id,
+              referredUserName: verify.name || '',
+              referredUserEmail: verify.email,
+              plan: plan,
+              baseAmount: baseAmount,
+              commissionAmount: commissionAmount,
+              razorpayPaymentId: razorpay_payment_id,
+              creditedAt: Date.now(),
+              unlocksAt: Date.now() + REFERRAL_UNLOCK_MS,
+              status: 'active'
+            });
+          }
+        }
+      } catch (refErr) {
+        // razorpayPaymentId-এর unique index থাকায়, এই রুট কখনো ভুল করে
+        // দুবার call হলেও duplicate commission তৈরি হবে না — এখানে শুধু
+        // সেই duplicate-key error (বা অন্য কোনো unexpected error) log
+        // হচ্ছে, payment success response-এ কোনো প্রভাব পড়বে না।
+        console.error('[razorpay/verify-payment] Referral commission crediting failed (payment itself still succeeded):', refErr.message || refErr);
+      }
     }
 
     res.json({
@@ -646,6 +750,107 @@ app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Verify payment error:', error.message || error);
     res.status(500).json({ message: 'Server error while verifying payment' });
+  }
+});
+
+// ============================================================
+// ৬.৬ — রেফারেল ড্যাশবোর্ড ও উইথড্র রিকোয়েস্ট (নতুন, আলাদা রুট)
+//
+// একজন ব্যবহারকারী শুধু নিজের রেফারেল-এর তথ্যই দেখতে পারবে — token থেকে
+// req.userEmail বের করেই query করা হয়, কারো ID পাঠিয়ে অন্যের ড্যাশবোর্ড
+// দেখার কোনো উপায় নেই। রেফার করা মানুষদের নাম ছাড়া আর কিছু (ইমেইল,
+// প্ল্যান, টাকার অঙ্ক) কখনো দেখানো হয় না।
+// ============================================================
+app.get('/api/referral/dashboard', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findOne({ email: req.userEmail });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (!user.referralCode) {
+      user.referralCode = await generateUniqueReferralCode();
+      await user.save();
+    }
+
+    const referredUsers = await User.find({ referredBy: user.referralCode }).select('_id name');
+    const commissions = await ReferralCommission.find({ referrerId: user._id });
+
+    const successfulReferredIds = new Set(commissions.map(c => String(c.referredUserId)));
+    const now = Date.now();
+
+    let withdrawableBalance = 0, lockedBalance = 0, lifetimeEarned = 0;
+    commissions.forEach(c => {
+      if (c.status === 'active') {
+        lifetimeEarned += c.commissionAmount;
+        if (c.unlocksAt <= now) withdrawableBalance += c.commissionAmount;
+        else lockedBalance += c.commissionAmount;
+      } else if (c.status === 'withdrawn') {
+        lifetimeEarned += c.commissionAmount;
+      }
+      // 'reversed' কমিশন কোনো হিসাবেই যোগ হয় না
+    });
+    withdrawableBalance = Math.round(withdrawableBalance * 100) / 100;
+    lockedBalance = Math.round(lockedBalance * 100) / 100;
+    lifetimeEarned = Math.round(lifetimeEarned * 100) / 100;
+
+    const referredList = referredUsers.map(r => ({
+      name: r.name || 'Unnamed',
+      status: successfulReferredIds.has(String(r._id)) ? 'successful' : 'pending'
+    }));
+
+    res.json({
+      referralCode: user.referralCode,
+      withdrawableBalance,
+      lockedBalance,
+      lifetimeEarned,
+      minWithdraw: REFERRAL_MIN_WITHDRAW,
+      referredUsers: referredList
+    });
+  } catch (error) {
+    console.error('Referral dashboard error:', error.message || error);
+    res.status(500).json({ message: 'Server error while loading referral dashboard' });
+  }
+});
+
+app.post('/api/referral/withdraw-request', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findOne({ email: req.userEmail });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const now = Date.now();
+    const commissions = await ReferralCommission.find({ referrerId: user._id, status: 'active' });
+    let withdrawableBalance = 0;
+    commissions.forEach(c => { if (c.unlocksAt <= now) withdrawableBalance += c.commissionAmount; });
+    withdrawableBalance = Math.round(withdrawableBalance * 100) / 100;
+
+    if (withdrawableBalance < REFERRAL_MIN_WITHDRAW) {
+      return res.status(400).json({
+        message: `Minimum withdrawal is ₹${REFERRAL_MIN_WITHDRAW}. Your current withdrawable balance is ₹${withdrawableBalance}.`,
+        withdrawableBalance
+      });
+    }
+
+    // একই সময়ে একাধিকবার ক্লিক করলে একাধিক pending request তৈরি না হোক —
+    // আগে থেকে pending থাকলে সেটাই আবার ফেরত দেওয়া হচ্ছে, নতুন করে বানানো
+    // হচ্ছে না।
+    let existing = await WithdrawalRequest.findOne({ userId: user._id, status: 'pending' });
+    if (!existing) {
+      existing = await WithdrawalRequest.create({
+        userId: user._id,
+        userEmail: user.email,
+        userName: user.name || '',
+        amount: withdrawableBalance,
+        requestedAt: now
+      });
+    }
+
+    res.json({
+      message: 'Withdrawal request received. Please contact our team to complete it.',
+      contactEmail: 'eanova.in@gmail.com',
+      amount: existing.amount
+    });
+  } catch (error) {
+    console.error('Withdrawal request error:', error.message || error);
+    res.status(500).json({ message: 'Server error while requesting withdrawal' });
   }
 });
 
