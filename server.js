@@ -10,30 +10,6 @@ const { Resend } = require('resend');
 require('dotenv').config();
 
 const User = require('./User');
-const ReferralCommission = require('./ReferralCommission');
-const WithdrawalRequest = require('./WithdrawalRequest');
-
-// ============================================================
-// রেফারেল প্রোগ্রাম — হেল্পার
-// ============================================================
-const REFERRAL_COMMISSION_RATE = 0.08;   // referred user-এর pre-GST প্ল্যান amount-এর 8%
-const REFERRAL_UNLOCK_MS = 7 * 24 * 60 * 60 * 1000; // ৭ দিন লক থাকবে, তারপর withdraw করা যাবে
-const REFERRAL_MIN_WITHDRAW = 100; // ₹100
-
-function generateReferralCodeCandidate() {
-  // ছোট, সহজে টাইপ/শেয়ার করা যায় এমন কোড — কিন্তু guess করা কঠিন হওয়ার
-  // জন্য যথেষ্ট এলোমেলো (৮ অক্ষর, base36, ~41 বিট এনট্রপি)।
-  return crypto.randomBytes(6).toString('base64url').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toUpperCase();
-}
-async function generateUniqueReferralCode() {
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const candidate = generateReferralCodeCandidate();
-    const exists = await User.findOne({ referralCode: candidate }).select('_id');
-    if (!exists) return candidate;
-  }
-  // অত্যন্ত অসম্ভব (৮ বারেও collision) — timestamp যোগ করে নিশ্চিত ইউনিক করা
-  return generateReferralCodeCandidate() + Date.now().toString(36).slice(-4).toUpperCase();
-}
 
 // ============================================================
 // আবশ্যিক এনভায়রনমেন্ট ভেরিয়েবল যাচাই — কোনোটা মিসিং থাকলে
@@ -258,27 +234,26 @@ app.post('/api/verify-otp', otpRequestLimiter, async (req, res) => {
     delete otpStore[email];
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // রেফারেল — কোড সত্যিই কোনো existing user-এর হলেই, এবং কারো নিজের
-    // ইমেইলের সাথে না মিললেই (trivial self-referral আটকানো) সেট হবে।
-    // referredBy একবার এখানেই সেট হয়, পরে আর কখনো বদলানো যায় না।
-    let referredByCode = null;
-    if (ref && typeof ref === 'string') {
-      const referrer = await User.findOne({ referralCode: ref.trim().toUpperCase() }).select('_id email referralCode');
-      if (referrer && referrer.email.toLowerCase() !== email.toLowerCase()) {
-        referredByCode = referrer.referralCode;
-      }
-    }
-    const myReferralCode = await generateUniqueReferralCode();
-
     const newUser = new User({
       name,
       firm,
       email,
       password: hashedPassword,
-      region: (region === 'intl') ? 'intl' : 'in',
-      referralCode: myReferralCode,
-      referredBy: referredByCode
+      region: (region === 'intl') ? 'intl' : 'in'
     });
+
+    // Share & Earn: এই নতুন একাউন্টের নিজস্ব referral code বানানো হলো,
+    // আর কেউ refer করে থাকলে (valid code হলে) সেটা referredBy-তে বসানো হলো।
+    await assignReferralCode(newUser);
+    if (ref) {
+      const refCode = String(ref).trim().toUpperCase();
+      if (refCode) {
+        const referrer = await User.findOne({ referralCode: refCode });
+        if (referrer && referrer.email !== email) {
+          newUser.referredBy = refCode;
+        }
+      }
+    }
 
     await newUser.save();
     res.status(201).json({ message: 'Account verified & registered successfully!', email });
@@ -303,14 +278,6 @@ app.post('/api/login', loginLimiter, async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
-
-    // Backfill: রেফারেল ফিচার আসার আগে যাদের account হয়েছিল, তাদের
-    // referralCode ছিল না — পরের যেকোনো login-এই একবার lazily বানিয়ে
-    // দেওয়া হচ্ছে, আলাদা migration script ছাড়াই।
-    if (!user.referralCode) {
-      user.referralCode = await generateUniqueReferralCode();
-      await user.save();
-    }
 
     const token = signToken(user);
 
@@ -395,38 +362,34 @@ app.post('/api/google-login', loginLimiter, async (req, res) => {
       // OTP লাগবে না। firm name খালি রাখা হলো, ইউজার পরে প্রোফাইল থেকে
       // ভরে নিতে পারবে — password নেই কারণ এই একাউন্ট শুধু Google দিয়েই
       // লগইন করবে।
-      let referredByCode = null;
-      if (ref && typeof ref === 'string') {
-        const referrer = await User.findOne({ referralCode: ref.trim().toUpperCase() }).select('_id email referralCode');
-        if (referrer && referrer.email.toLowerCase() !== email.toLowerCase()) {
-          referredByCode = referrer.referralCode;
-        }
-      }
-      const myReferralCode = await generateUniqueReferralCode();
       user = new User({
         name: payload.name || email.split('@')[0],
         firm: '',
         email,
         googleId,
         region: 'in',
-        profilePic: payload.picture || '',
-        referralCode: myReferralCode,
-        referredBy: referredByCode
+        profilePic: payload.picture || ''
       });
+
+      // Share & Earn: OTP signup-এর মতোই — নতুন একাউন্টের নিজের referral
+      // code বানানো, আর valid ref code থাকলে referredBy বসানো।
+      await assignReferralCode(user);
+      if (ref) {
+        const refCode = String(ref).trim().toUpperCase();
+        if (refCode) {
+          const referrer = await User.findOne({ referralCode: refCode });
+          if (referrer && referrer.email !== email) {
+            user.referredBy = refCode;
+          }
+        }
+      }
+
       await user.save();
     } else if (!user.googleId) {
       // আগে থেকেই ইমেইল/পাসওয়ার্ড দিয়ে account ছিল — এই Google
       // একাউন্টটা তার সাথে link করে দেওয়া হলো, existing password/data
       // কিছুই বদলানো হয় না।
       user.googleId = googleId;
-      await user.save();
-    }
-
-    // Backfill: রেফারেল ফিচার আসার আগে যাদের account হয়েছিল, তাদের
-    // referralCode ছিল না — পরের যেকোনো login-এই একবার lazily বানিয়ে
-    // দেওয়া হচ্ছে, আলাদা migration script ছাড়াই।
-    if (!user.referralCode) {
-      user.referralCode = await generateUniqueReferralCode();
       await user.save();
     }
 
@@ -580,6 +543,132 @@ const PLAN_BASE_INR = {
 };
 const GST_RATE = 0.18;
 
+// ============================================================
+// SHARE & EARN (রেফারেল) — কনস্ট্যান্ট ও হেল্পার
+//
+// - প্রতিটা successful plan purchase-এ referrer 8% commission পাবে
+//   (base amount-এর উপর, GST বাদে), যতদিন referred account থাকবে।
+// - commission ৭ দিন hold-এ থাকে (REFERRAL_HOLD_MS) — এই সময়ের মধ্যে
+//   referred user যদি refund নেয় (founder manually Razorpay dashboard
+//   থেকে refund করে, তারপর /api/admin/mark-refunded কল করে), তাহলে
+//   ওই কমিশন 'reversed' হয়ে যাবে।
+// - Withdraw করতে minimum ₹100 available balance লাগবে (MIN_WITHDRAWAL_INR)।
+// ============================================================
+const REFERRAL_COMMISSION_RATE = 0.08;
+const REFERRAL_HOLD_MS = 7 * 24 * 60 * 60 * 1000; // ৭ দিন
+const MIN_WITHDRAWAL_INR = 100;
+
+// একটা random, unique referral code বানিয়ে user ডকুমেন্টে বসিয়ে দেয়।
+// এখনো save করা হয় না — caller-কেই user.save() করতে হবে।
+async function assignReferralCode(userDoc) {
+  for (let i = 0; i < 6; i++) {
+    const candidate = crypto.randomBytes(4).toString('hex').toUpperCase(); // ৮ ক্যারেক্টার
+    const exists = await User.findOne({ referralCode: candidate });
+    if (!exists) {
+      userDoc.referralCode = candidate;
+      return candidate;
+    }
+  }
+  // অত্যন্ত বিরল ফলব্যাক — নিজের ডাটাবেস আইডি থেকে বানানো, এটা সবসময় ইউনিক
+  const fallback = userDoc._id.toString().slice(-8).toUpperCase();
+  userDoc.referralCode = fallback;
+  return fallback;
+}
+
+// ইমেইল আংশিকভাবে লুকিয়ে দেখায়, referrer-কে referred ব্যক্তির পুরো
+// ইমেইল দেখানো হয় না।
+function maskEmailServer(email) {
+  if (!email) return '';
+  const parts = String(email).split('@');
+  if (parts.length !== 2) return email;
+  const name = parts[0];
+  const masked = name.length <= 2 ? (name[0] || '') + '*' : name.slice(0, 2) + '***';
+  return masked + '@' + parts[1];
+}
+
+// একজন ইউজারের pointsLedger থেকে available / on-hold / total ইত্যাদি হিসাব
+// করে — কোনো ডাটাবেস রাইট করে না, শুধু read-only summary।
+function summarizePoints(user) {
+  const now = Date.now();
+  const ledger = user.pointsLedger || [];
+  let availableBalance = 0, onHold = 0, totalEarned = 0, withdrawn = 0, reversed = 0;
+
+  const history = ledger.map(function (e) {
+    let status = e.status;
+    if (e.type === 'earn') {
+      totalEarned += e.amount;
+      if (e.status === 'reversed') {
+        reversed += e.amount;
+        status = 'reversed';
+      } else if (e.status === 'withdrawn') {
+        withdrawn += e.amount;
+        status = 'withdrawn';
+      } else if (now >= e.availableAt) {
+        availableBalance += e.amount;
+        status = 'available';
+      } else {
+        onHold += e.amount;
+        status = 'on_hold';
+      }
+    }
+    return {
+      id: e.id,
+      amount: e.amount,
+      planPurchased: e.planPurchased,
+      buyerEmailMasked: maskEmailServer(e.buyerEmail),
+      createdAt: e.createdAt,
+      availableAt: e.availableAt,
+      status: status
+    };
+  });
+
+  history.sort(function (a, b) { return b.createdAt - a.createdAt; });
+
+  return {
+    availableBalance: Math.round(availableBalance * 100) / 100,
+    onHold: Math.round(onHold * 100) / 100,
+    totalEarned: Math.round(totalEarned * 100) / 100,
+    withdrawn: Math.round(withdrawn * 100) / 100,
+    reversed: Math.round(reversed * 100) / 100,
+    history: history
+  };
+}
+
+// Razorpay-তে সত্যিকারের টাকা দিয়ে plan কেনা হলে এটা কল হয় — buyer-এর
+// referredBy থাকলে সেই referrer-কে 8% commission (base amount-এর উপর,
+// GST বাদে) points হিসেবে জমা দেয়, ৭ দিনের hold সহ। কোনো ভুল হলেও এটা
+// পুরো পেমেন্ট ফ্লো ভেঙে না দেয়ার জন্য নিজের try/catch-এ রাখা।
+async function creditReferralCommission(buyerUser, plan, purchaseRef) {
+  try {
+    if (!buyerUser || !buyerUser.referredBy) return;
+    const baseAmount = PLAN_BASE_INR[plan];
+    if (!baseAmount) return;
+
+    const referrer = await User.findOne({ referralCode: buyerUser.referredBy });
+    if (!referrer || referrer.email === buyerUser.email) return; // self-referral গার্ড
+
+    const commission = Math.round(baseAmount * REFERRAL_COMMISSION_RATE * 100) / 100;
+    const now = Date.now();
+
+    referrer.pointsLedger = referrer.pointsLedger || [];
+    referrer.pointsLedger.push({
+      id: crypto.randomUUID(),
+      type: 'earn',
+      amount: commission,
+      planPurchased: plan,
+      buyerEmail: buyerUser.email,
+      purchaseRef: purchaseRef,
+      createdAt: now,
+      availableAt: now + REFERRAL_HOLD_MS,
+      status: 'active'
+    });
+    referrer.markModified('pointsLedger');
+    await referrer.save();
+  } catch (e) {
+    console.error('[referral] commission credit failed:', e.message || e);
+  }
+}
+
 app.post('/api/razorpay/create-order', requireAuth, async (req, res) => {
   try {
     if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
@@ -675,10 +764,6 @@ app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
     const user = await User.findOne({ email: req.userEmail });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    // রেফারেল কমিশন শুধু কারো *প্রথম* সফল পেমেন্টেই দেওয়া হয় — তাই এই
-    // flag-টা overwrite করার আগেই capture করে রাখা হচ্ছে।
-    const isFirstEverPurchase = !user.hasPaidBefore;
-
     // ঠিক update-profile রুট যা করে সেই একই activation — এখানে আলাদাভাবে
     // লেখা হলো যাতে সেই existing রুটটা একদম অক্ষত থাকে।
     user.subscriptionActive = true;
@@ -696,41 +781,10 @@ app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
       return res.status(500).json({ message: 'Payment verified but activation failed to save — please contact support with your payment ID: ' + razorpay_payment_id });
     }
 
-    // রেফারেল কমিশন — শুধুমাত্র (ক) এটা এই user-এর জীবনের প্রথম পেমেন্ট
-    // হলে, এবং (খ) সে কারো রেফারেল লিংক দিয়ে account খুলেছিল। কখনো
-    // payment-এর মূল response-কে ব্যর্থ হতে দেওয়া হয় না এই কারণে — টাকা
-    // তো সত্যিই কাটা হয়ে গেছে, referral-crediting ব্যর্থ হলে সেটা শুধু
-    // log হবে, customer কখনো এর জন্য আটকে থাকবে না।
-    if (isFirstEverPurchase && verify.referredBy) {
-      try {
-        const referrer = await User.findOne({ referralCode: verify.referredBy }).select('_id');
-        if (referrer) {
-          const baseAmount = PLAN_BASE_INR[plan] || 0;
-          const commissionAmount = Math.round(baseAmount * REFERRAL_COMMISSION_RATE * 100) / 100;
-          if (commissionAmount > 0) {
-            await ReferralCommission.create({
-              referrerId: referrer._id,
-              referredUserId: verify._id,
-              referredUserName: verify.name || '',
-              referredUserEmail: verify.email,
-              plan: plan,
-              baseAmount: baseAmount,
-              commissionAmount: commissionAmount,
-              razorpayPaymentId: razorpay_payment_id,
-              creditedAt: Date.now(),
-              unlocksAt: Date.now() + REFERRAL_UNLOCK_MS,
-              status: 'active'
-            });
-          }
-        }
-      } catch (refErr) {
-        // razorpayPaymentId-এর unique index থাকায়, এই রুট কখনো ভুল করে
-        // দুবার call হলেও duplicate commission তৈরি হবে না — এখানে শুধু
-        // সেই duplicate-key error (বা অন্য কোনো unexpected error) log
-        // হচ্ছে, payment success response-এ কোনো প্রভাব পড়বে না।
-        console.error('[razorpay/verify-payment] Referral commission crediting failed (payment itself still succeeded):', refErr.message || refErr);
-      }
-    }
+    // Share & Earn: এই পেমেন্ট real টাকা দিয়ে হয়েছে confirm হওয়ার পরই
+    // referrer-কে (থাকলে) 8% commission credit করা হচ্ছে। এটা ব্যর্থ
+    // হলেও পুরো পেমেন্ট রেসপন্স আটকাবে না (নিজের try/catch ভিতরে আছে)।
+    await creditReferralCommission(verify, plan, razorpay_payment_id);
 
     res.json({
       message: 'Payment verified and subscription activated!',
@@ -750,107 +804,6 @@ app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Verify payment error:', error.message || error);
     res.status(500).json({ message: 'Server error while verifying payment' });
-  }
-});
-
-// ============================================================
-// ৬.৬ — রেফারেল ড্যাশবোর্ড ও উইথড্র রিকোয়েস্ট (নতুন, আলাদা রুট)
-//
-// একজন ব্যবহারকারী শুধু নিজের রেফারেল-এর তথ্যই দেখতে পারবে — token থেকে
-// req.userEmail বের করেই query করা হয়, কারো ID পাঠিয়ে অন্যের ড্যাশবোর্ড
-// দেখার কোনো উপায় নেই। রেফার করা মানুষদের নাম ছাড়া আর কিছু (ইমেইল,
-// প্ল্যান, টাকার অঙ্ক) কখনো দেখানো হয় না।
-// ============================================================
-app.get('/api/referral/dashboard', requireAuth, async (req, res) => {
-  try {
-    const user = await User.findOne({ email: req.userEmail });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    if (!user.referralCode) {
-      user.referralCode = await generateUniqueReferralCode();
-      await user.save();
-    }
-
-    const referredUsers = await User.find({ referredBy: user.referralCode }).select('_id name');
-    const commissions = await ReferralCommission.find({ referrerId: user._id });
-
-    const successfulReferredIds = new Set(commissions.map(c => String(c.referredUserId)));
-    const now = Date.now();
-
-    let withdrawableBalance = 0, lockedBalance = 0, lifetimeEarned = 0;
-    commissions.forEach(c => {
-      if (c.status === 'active') {
-        lifetimeEarned += c.commissionAmount;
-        if (c.unlocksAt <= now) withdrawableBalance += c.commissionAmount;
-        else lockedBalance += c.commissionAmount;
-      } else if (c.status === 'withdrawn') {
-        lifetimeEarned += c.commissionAmount;
-      }
-      // 'reversed' কমিশন কোনো হিসাবেই যোগ হয় না
-    });
-    withdrawableBalance = Math.round(withdrawableBalance * 100) / 100;
-    lockedBalance = Math.round(lockedBalance * 100) / 100;
-    lifetimeEarned = Math.round(lifetimeEarned * 100) / 100;
-
-    const referredList = referredUsers.map(r => ({
-      name: r.name || 'Unnamed',
-      status: successfulReferredIds.has(String(r._id)) ? 'successful' : 'pending'
-    }));
-
-    res.json({
-      referralCode: user.referralCode,
-      withdrawableBalance,
-      lockedBalance,
-      lifetimeEarned,
-      minWithdraw: REFERRAL_MIN_WITHDRAW,
-      referredUsers: referredList
-    });
-  } catch (error) {
-    console.error('Referral dashboard error:', error.message || error);
-    res.status(500).json({ message: 'Server error while loading referral dashboard' });
-  }
-});
-
-app.post('/api/referral/withdraw-request', requireAuth, async (req, res) => {
-  try {
-    const user = await User.findOne({ email: req.userEmail });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const now = Date.now();
-    const commissions = await ReferralCommission.find({ referrerId: user._id, status: 'active' });
-    let withdrawableBalance = 0;
-    commissions.forEach(c => { if (c.unlocksAt <= now) withdrawableBalance += c.commissionAmount; });
-    withdrawableBalance = Math.round(withdrawableBalance * 100) / 100;
-
-    if (withdrawableBalance < REFERRAL_MIN_WITHDRAW) {
-      return res.status(400).json({
-        message: `Minimum withdrawal is ₹${REFERRAL_MIN_WITHDRAW}. Your current withdrawable balance is ₹${withdrawableBalance}.`,
-        withdrawableBalance
-      });
-    }
-
-    // একই সময়ে একাধিকবার ক্লিক করলে একাধিক pending request তৈরি না হোক —
-    // আগে থেকে pending থাকলে সেটাই আবার ফেরত দেওয়া হচ্ছে, নতুন করে বানানো
-    // হচ্ছে না।
-    let existing = await WithdrawalRequest.findOne({ userId: user._id, status: 'pending' });
-    if (!existing) {
-      existing = await WithdrawalRequest.create({
-        userId: user._id,
-        userEmail: user.email,
-        userName: user.name || '',
-        amount: withdrawableBalance,
-        requestedAt: now
-      });
-    }
-
-    res.json({
-      message: 'Withdrawal request received. Please contact our team to complete it.',
-      contactEmail: 'eanova.in@gmail.com',
-      amount: existing.amount
-    });
-  } catch (error) {
-    console.error('Withdrawal request error:', error.message || error);
-    res.status(500).json({ message: 'Server error while requesting withdrawal' });
   }
 });
 
@@ -976,6 +929,165 @@ app.post('/api/check-reconciliation-limit', requireAuth, ensureOwnEmail, async (
     // নেটওয়ার্ক/ডিবি সমস্যায় ট্রায়াল ইউজারের একমাত্র ওয়ার্কফ্লো
     // আটকে না যায়, তাই আগের মতোই fail-open রাখা হলো।
     res.json({ allowed: true, reason: 'check-failed-open' });
+  }
+});
+
+// ============================================================
+// ১০. SHARE & EARN — নিজের referral code, লিংক, ও পয়েন্টস সামারি
+//     (লগইন টোকেন আবশ্যক)
+// ============================================================
+app.get('/api/referral/info', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findOne({ email: req.userEmail });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // পুরনো একাউন্ট (এই ফিচার আসার আগের) হলে এখনই একটা referral code
+    // বসিয়ে দেওয়া হচ্ছে, যাতে সবাই এই ফিচার ব্যবহার করতে পারে।
+    if (!user.referralCode) {
+      await assignReferralCode(user);
+      await user.save();
+    }
+
+    const points = summarizePoints(user);
+    res.json({
+      referralCode: user.referralCode,
+      referralLink: 'https://www.eanova.in/?ref=' + user.referralCode,
+      points: points,
+      minWithdrawalInr: MIN_WITHDRAWAL_INR,
+      withdrawalRequests: (user.withdrawalRequests || [])
+        .slice()
+        .sort(function (a, b) { return b.createdAt - a.createdAt; })
+    });
+  } catch (err) {
+    console.error('Error fetching referral info:', err.message || err);
+    res.status(500).json({ message: 'Server error fetching referral info' });
+  }
+});
+
+// ============================================================
+// ১১. SHARE & EARN — উইথড্রয়াল রিকোয়েস্ট
+//     (আসল টাকা পাঠানো ম্যানুয়ালি হবে — এই রুট শুধু রিকোয়েস্টটা
+//     রেকর্ড করে রাখে এবং সেই মুহূর্তের available পয়েন্ট lock করে,
+//     যাতে একই পয়েন্ট দুইবার withdraw request করা না যায়। ইউজারকে
+//     Live Chat / email-এ গিয়ে বিস্তারিত (bank/UPI QR) জানাতে হবে,
+//     তারপর founder ম্যানুয়ালি টাকা পাঠাবে।)
+// ============================================================
+app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
+  try {
+    const { contactMethod, payoutMethod, payoutDetails } = req.body;
+    if (!['livechat', 'email'].includes(contactMethod)) {
+      return res.status(400).json({ message: 'Please choose Live Chat or Email as your contact method.' });
+    }
+    if (!['bank', 'upi_qr'].includes(payoutMethod)) {
+      return res.status(400).json({ message: 'Please choose how you want to receive payment (bank details or UPI QR).' });
+    }
+
+    const user = await User.findOne({ email: req.userEmail });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const points = summarizePoints(user);
+    if (points.availableBalance < MIN_WITHDRAWAL_INR) {
+      return res.status(400).json({
+        message: 'You need at least ₹' + MIN_WITHDRAWAL_INR + ' in available balance to withdraw. Newly earned points also need 7 days to clear first.'
+      });
+    }
+
+    const now = Date.now();
+    const amount = points.availableBalance;
+
+    // এই মুহূর্তে যা "available" ছিল, সেই ledger entry-গুলোকে withdrawn
+    // মার্ক করে দেওয়া হচ্ছে, যাতে দ্বিতীয়বার একই পয়েন্ট withdraw
+    // request করা না যায়।
+    (user.pointsLedger || []).forEach(function (e) {
+      if (e.type === 'earn' && e.status === 'active' && now >= e.availableAt) {
+        e.status = 'withdrawn';
+      }
+    });
+
+    user.withdrawalRequests = user.withdrawalRequests || [];
+    user.withdrawalRequests.push({
+      id: crypto.randomUUID(),
+      amount: amount,
+      contactMethod: contactMethod,
+      payoutMethod: payoutMethod,
+      payoutDetails: String(payoutDetails || '').slice(0, 500),
+      createdAt: now,
+      status: 'pending'
+    });
+
+    user.markModified('pointsLedger');
+    user.markModified('withdrawalRequests');
+    await user.save();
+
+    res.json({
+      message: 'Withdrawal request received for ₹' + amount + '. Please continue on ' +
+        (contactMethod === 'livechat' ? 'Live Chat' : 'email') + ' to complete verification and receive payment.',
+      amount: amount
+    });
+  } catch (err) {
+    console.error('Error requesting withdrawal:', err.message || err);
+    res.status(500).json({ message: 'Server error requesting withdrawal' });
+  }
+});
+
+// ============================================================
+// ১২. ADMIN — Refund হলে referral commission reverse করা
+//     (লগইন টোকেন নয়, বরং ADMIN_SECRET এনভায়রনমেন্ট ভ্যারিয়েবল দিয়ে
+//     প্রোটেক্টেড — founder নিজে Razorpay dashboard থেকে refund করার
+//     পর এই রুটটা ম্যানুয়ালি (curl/Postman দিয়ে) কল করবে। ADMIN_SECRET
+//     সেট করা না থাকলে এই রুট নিরাপদে সবসময় বন্ধ থাকবে, কখনো ভুল করে
+//     খোলা থাকবে না।)
+// ============================================================
+app.post('/api/admin/mark-refunded', async (req, res) => {
+  try {
+    if (!process.env.ADMIN_SECRET) {
+      return res.status(500).json({ message: 'Admin actions are not configured on the server yet (ADMIN_SECRET not set).' });
+    }
+    const { adminSecret, razorpayPaymentId } = req.body;
+    if (adminSecret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ message: 'Invalid admin secret' });
+    }
+    if (!razorpayPaymentId) {
+      return res.status(400).json({ message: 'razorpayPaymentId is required' });
+    }
+
+    const referrer = await User.findOne({ 'pointsLedger.purchaseRef': razorpayPaymentId });
+    if (!referrer) {
+      return res.status(404).json({ message: 'No referral commission found for this payment ID — maybe this purchase had no referrer.' });
+    }
+
+    let reversedAmount = 0;
+    let alreadySettled = false;
+    (referrer.pointsLedger || []).forEach(function (e) {
+      if (e.purchaseRef === razorpayPaymentId && e.type === 'earn') {
+        if (e.status === 'active') {
+          e.status = 'reversed';
+          reversedAmount = e.amount;
+        } else {
+          alreadySettled = true;
+        }
+      }
+    });
+    referrer.markModified('pointsLedger');
+    await referrer.save();
+
+    if (reversedAmount > 0) {
+      return res.json({
+        message: 'Reversed ₹' + reversedAmount + ' referral commission for ' + referrer.email + '.',
+        referrerEmail: referrer.email,
+        reversedAmount: reversedAmount
+      });
+    }
+    return res.json({
+      message: alreadySettled
+        ? 'That commission was already withdrawn or already reversed — no automatic change made. Adjust manually in Atlas if the payout already went out.'
+        : 'Found the referrer but no matching active commission entry for this payment ID.',
+      referrerEmail: referrer.email,
+      reversedAmount: 0
+    });
+  } catch (err) {
+    console.error('Error marking refund:', err.message || err);
+    res.status(500).json({ message: 'Server error processing refund reversal' });
   }
 });
 

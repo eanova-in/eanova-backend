@@ -34,17 +34,31 @@ const userSchema = new mongoose.Schema({
 
   clients: { type: Array, default: [] },
 
-  // Referral program. referralCode is this user's own shareable code
-  // (assigned once, at account creation, for every account — random and
-  // non-sequential so codes can't be guessed/enumerated). referredBy is
-  // the code THEY signed up with, if any — set once at creation and never
-  // changed afterward, so it can't be gamed by editing it post-signup.
-  referralCode: { type: String, unique: true, sparse: true, index: true },
+  // ------------------------------------------------------------------
+  // Share & Earn (referral) — added [date TBD].
+  // referralCode: this user's own unique code, given out in their
+  // referral link (eanova.in/?ref=CODE). Generated once at signup and
+  // never reused, so it can double as a lookup key.
+  // referredBy: the referralCode of whoever referred *this* user, if
+  // any — set once at signup, never changed afterwards.
+  // pointsLedger: append-only history of referral commission earned by
+  // this user. Each entry is 8% of a referred account's plan purchase,
+  // held for 7 days (availableAt) before it can be withdrawn, to cover
+  // the refund window. status moves active -> withdrawn (once a
+  // withdrawal request is made) or active -> reversed (if the referred
+  // purchase was refunded within the 7-day window; set manually by the
+  // founder via /api/admin/mark-refunded when a Razorpay refund is
+  // processed, since refunds themselves are handled manually outside
+  // this app).
+  // withdrawalRequests: log of "please pay me" requests — the actual
+  // payout (UPI/bank transfer) happens manually outside the app after
+  // the user confirms details over Live Chat or email, so this is a
+  // record, not a payment integration.
+  // ------------------------------------------------------------------
+  referralCode: { type: String, default: null, unique: true, sparse: true },
   referredBy: { type: String, default: null },
-  // Set when the user clicks "Request Withdrawal" while eligible (balance
-  // >= ₹100) — just a marker so the founder can find pending requests;
-  // actual payout is manual (see the withdraw-request route's response).
-  referralWithdrawalRequestedAt: { type: Number, default: null }
+  pointsLedger: { type: Array, default: [] },
+  withdrawalRequests: { type: Array, default: [] }
 });
 
 module.exports = mongoose.model('User', userSchema);
