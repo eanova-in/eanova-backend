@@ -555,6 +555,9 @@ const GST_RATE = 0.18;
 // - Withdraw করতে minimum ₹100 available balance লাগবে (MIN_WITHDRAWAL_INR)।
 // ============================================================
 const REFERRAL_COMMISSION_RATE = 0.08;
+// একজন ইউজারের প্রথম referred account-এর প্রথম plan কেনায় এক-বারের বোনাস রেট।
+// (এরপর সব কেনায় আবার সাধারণ 8%) — রেট বদলাতে শুধু এই লাইনটা বদলাও।
+const FIRST_REFERRAL_COMMISSION_RATE = 0.20;
 const REFERRAL_HOLD_MS = 7 * 24 * 60 * 60 * 1000; // ৭ দিন
 const MIN_WITHDRAWAL_INR = 100;
 
@@ -647,7 +650,25 @@ async function creditReferralCommission(buyerUser, plan, purchaseRef) {
     const referrer = await User.findOne({ referralCode: buyerUser.referredBy });
     if (!referrer || referrer.email === buyerUser.email) return; // self-referral গার্ড
 
-    const commission = Math.round(baseAmount * REFERRAL_COMMISSION_RATE * 100) / 100;
+    // প্রথম-রেফারেল বোনাস: শুধু যদি (ক) এই buyer-ই referrer-এর সবচেয়ে প্রথম
+    // referred account হয়, এবং (খ) এটা তার প্রথম কেনা (এই buyer থেকে আগে
+    // কোনো commission entry নেই)। প্রথম referred ব্যক্তি কিছু না কিনলে বোনাস
+    // ব্যবহার হয় না, পরের রেফারেলগুলো সাধারণ 8% পায়।
+    let rate = REFERRAL_COMMISSION_RATE;
+    let firstReferralBonus = false;
+    const alreadyEarnedFromBuyer = (referrer.pointsLedger || []).some(function (e) {
+      return e.type === 'earn' && e.buyerEmail === buyerUser.email;
+    });
+    if (!alreadyEarnedFromBuyer) {
+      const firstReferred = await User.findOne({ referredBy: referrer.referralCode })
+        .sort({ _id: 1 }).select('_id');
+      if (firstReferred && String(firstReferred._id) === String(buyerUser._id)) {
+        rate = FIRST_REFERRAL_COMMISSION_RATE;
+        firstReferralBonus = true;
+      }
+    }
+
+    const commission = Math.round(baseAmount * rate * 100) / 100;
     const now = Date.now();
 
     referrer.pointsLedger = referrer.pointsLedger || [];
@@ -658,6 +679,8 @@ async function creditReferralCommission(buyerUser, plan, purchaseRef) {
       planPurchased: plan,
       buyerEmail: buyerUser.email,
       purchaseRef: purchaseRef,
+      rate: rate,
+      firstReferralBonus: firstReferralBonus,
       createdAt: now,
       availableAt: now + REFERRAL_HOLD_MS,
       status: 'active'
@@ -1109,6 +1132,93 @@ app.post('/api/admin/mark-refunded', async (req, res) => {
   } catch (err) {
     console.error('Error marking refund:', err.message || err);
     res.status(500).json({ message: 'Server error processing refund reversal' });
+  }
+});
+
+// ============================================================
+// ১৩. ADMIN — Founder-only business metrics (KPI)
+//     ADMIN_SECRET দিয়ে প্রোটেক্টেড; কাস্টমারদের ড্যাশবোর্ডে এসব দেখানো
+//     হয় না (MRR/churn শুধু founder-এর জন্য)। যা ডাটাবেসে আসলে আছে সেটা
+//     থেকেই হিসাব — অনুমানভিত্তিক অংশগুলো response-এর "notes"-এ লেখা আছে।
+// ============================================================
+app.post('/api/admin/metrics', async (req, res) => {
+  try {
+    if (!process.env.ADMIN_SECRET) {
+      return res.status(500).json({ message: 'Admin actions are not configured on the server yet (ADMIN_SECRET not set).' });
+    }
+    if ((req.body || {}).adminSecret !== process.env.ADMIN_SECRET) {
+      return res.status(403).json({ message: 'Invalid admin secret' });
+    }
+
+    const users = await User.find({})
+      .select('_id hasPaidBefore subscriptionActive activePlan subscriptionExpiry referredBy')
+      .lean();
+    const now = Date.now();
+    const monthKey = function (d) {
+      return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0');
+    };
+
+    // এই ৬ মাসের বাকেট বানানো (সবচেয়ে পুরনো → এই মাস)
+    const buckets = {};
+    const order = [];
+    const base = new Date();
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() - i, 1));
+      const k = monthKey(d);
+      buckets[k] = { month: k, trialSignups: 0, referredSignups: 0, convertedToPaid: 0 };
+      order.push(k);
+    }
+
+    let paidEver = 0, activePaidFirms = 0, mrr = 0, referredTotal = 0;
+    const MRR_PER_PLAN = {
+      first: PLAN_BASE_INR.first,
+      monthly: PLAN_BASE_INR.monthly,
+      annual: PLAN_BASE_INR.annual / 12
+    };
+
+    users.forEach(function (u) {
+      const created = u._id.getTimestamp();
+      const b = buckets[monthKey(created)];
+      if (b) {
+        b.trialSignups += 1;
+        if (u.referredBy) b.referredSignups += 1;
+        if (u.hasPaidBefore) b.convertedToPaid += 1;
+      }
+      if (u.referredBy) referredTotal += 1;
+      if (u.hasPaidBefore) paidEver += 1;
+      if (u.subscriptionActive && u.subscriptionExpiry && u.subscriptionExpiry > now) {
+        activePaidFirms += 1;
+        mrr += MRR_PER_PLAN[u.activePlan] || 0;
+      }
+    });
+
+    const totalAccounts = users.length;
+    const pct = function (a, b) { return b > 0 ? Math.round((a / b) * 1000) / 10 : 0; };
+
+    res.json({
+      asOf: new Date(now).toISOString(),
+      totalAccounts: totalAccounts,
+      paidEver: paidEver,
+      activePaidFirms: activePaidFirms,
+      trialToPaidConversionPct: pct(paidEver, totalAccounts),
+      referredSignupsTotal: referredTotal,
+      mrrInr: Math.round(mrr),
+      arrInr: Math.round(mrr * 12),
+      lapsedPaidPct: pct(paidEver - activePaidFirms, paidEver),
+      monthly: order.map(function (k) {
+        const b = buckets[k];
+        return Object.assign({}, b, { conversionPct: pct(b.convertedToPaid, b.trialSignups) });
+      }),
+      notes: [
+        'Signup month is derived from each account\'s database ID timestamp.',
+        'MRR/ARR are estimated from currently active plans at base price (annual = 1800/12), excluding extra charges.',
+        'lapsedPaidPct = share of accounts that paid at least once but have no active plan now. It is an approximation of churn — payment history is not stored, so true monthly churn cannot be computed yet.',
+        'NPS / customer feedback is not collected yet.'
+      ]
+    });
+  } catch (err) {
+    console.error('Error computing metrics:', err.message || err);
+    res.status(500).json({ message: 'Server error computing metrics' });
   }
 });
 
