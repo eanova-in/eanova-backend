@@ -58,7 +58,14 @@ const userSchema = new mongoose.Schema({
   referralCode: { type: String, default: null, unique: true, sparse: true },
   referredBy: { type: String, default: null },
   pointsLedger: { type: Array, default: [] },
-  withdrawalRequests: { type: Array, default: [] }
+  withdrawalRequests: { type: Array, default: [] },
+  // Referral milestone gifts (15 / 30 / 60 / 99 successful referrals — a
+  // "successful" referral is a referred account that has bought at least
+  // one plan, i.e. hasPaidBefore=true). Each entry: { milestone, status,
+  // contactMethod, requestedAt }. The count itself is never stored here —
+  // it's always recalculated server-side from real User documents at
+  // claim time, so it can't be edited or inflated from the client.
+  milestoneClaims: { type: Array, default: [] }
 });
 
 module.exports = mongoose.model('User', userSchema);

@@ -12,6 +12,17 @@ require('dotenv').config();
 const User = require('./User');
 
 // ============================================================
+// সাইট রেটিং (১-৫ স্টার পপআপ) — এটা কোনো account/login-এর সাথে যুক্ত না,
+// শুধু ভিজিটরদের aggregate রেটিং জমা রাখার একটা হালকা, আলাদা কালেকশন।
+// কোনো ব্যক্তিগত তথ্য (নাম/ইমেইল/আইপি) রাখা হয় না — শুধু স্টার সংখ্যা ও সময়।
+// ============================================================
+const siteRatingSchema = new mongoose.Schema({
+  stars: { type: Number, required: true, min: 1, max: 5 },
+  createdAt: { type: Number, default: () => Date.now() }
+});
+const SiteRating = mongoose.model('SiteRating', siteRatingSchema);
+
+// ============================================================
 // আবশ্যিক এনভায়রনমেন্ট ভেরিয়েবল যাচাই — কোনোটা মিসিং থাকলে
 // সার্ভার চালু হওয়ার আগেই বন্ধ হয়ে যাবে, যাতে সিক্রেট ছাড়া
 // অ্যাপ কখনো ভুলবশত লাইভ না হয়ে যায়।
@@ -557,9 +568,16 @@ const GST_RATE = 0.18;
 const REFERRAL_COMMISSION_RATE = 0.08;
 // একজন ইউজারের প্রথম referred account-এর প্রথম plan কেনায় এক-বারের বোনাস রেট।
 // (এরপর সব কেনায় আবার সাধারণ 8%) — রেট বদলাতে শুধু এই লাইনটা বদলাও।
-const FIRST_REFERRAL_COMMISSION_RATE = 0.20;
+const FIRST_REFERRAL_COMMISSION_RATE = 0.18;
 const REFERRAL_HOLD_MS = 7 * 24 * 60 * 60 * 1000; // ৭ দিন
 const MIN_WITHDRAWAL_INR = 100;
+
+// Referral milestone gifts — reward tiers by number of *successful*
+// referrals (a referred account that has bought at least one plan).
+// The gift itself is decided by the founder manually per the standing
+// instruction ("ami mon moto gift dibo") — this just tracks eligibility
+// and claim requests, it never picks or ships a gift automatically.
+const REFERRAL_MILESTONES = [15, 30, 60, 99];
 
 // একটা random, unique referral code বানিয়ে user ডকুমেন্টে বসিয়ে দেয়।
 // এখনো save করা হয় না — caller-কেই user.save() করতে হবে।
@@ -992,11 +1010,27 @@ app.get('/api/referral/info', requireAuth, async (req, res) => {
       };
     });
 
+    // Milestone gifts — count is always computed fresh from real DB
+    // records above (referredDocs), never trusted from the client.
+    const successfulReferralsCount = referredAccounts.filter(function (a) { return a.status === 'success'; }).length;
+    const claimedMilestones = {};
+    (user.milestoneClaims || []).forEach(function (c) { claimedMilestones[c.milestone] = c.status; });
+    const milestones = REFERRAL_MILESTONES.map(function (m) {
+      return {
+        milestone: m,
+        reached: successfulReferralsCount >= m,
+        progress: Math.min(successfulReferralsCount, m),
+        status: claimedMilestones[m] || null // null | 'pending' | 'fulfilled'
+      };
+    });
+
     res.json({
       referralCode: user.referralCode,
       referralLink: 'https://www.eanova.in/?ref=' + user.referralCode,
       points: points,
       referredAccounts: referredAccounts,
+      successfulReferralsCount: successfulReferralsCount,
+      milestones: milestones,
       minWithdrawalInr: MIN_WITHDRAWAL_INR,
       withdrawalRequests: (user.withdrawalRequests || [])
         .slice()
@@ -1075,7 +1109,59 @@ app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
 });
 
 // ============================================================
-// ১২. ADMIN — Refund হলে referral commission reverse করা
+// ১২. SHARE & EARN — মাইলস্টোন গিফট ক্লেইম (১৫/৩০/৬০/৯৯ সফল রেফারেল)
+//     এখানেও সংখ্যা client থেকে নেওয়া হয় না — DB থেকে সত্যিকারের
+//     referredBy রেকর্ড গুনেই eligibility চেক হয়, তাই কোড/হ্যাক করে
+//     মাইলস্টোন বাড়ানো সম্ভব না। Reward automatic না — founder Live
+//     Chat/email-এ verify করে নিজে ঠিক করবে কী গিফট দেবে।
+// ============================================================
+app.post('/api/referral/claim-milestone', requireAuth, async (req, res) => {
+  try {
+    const { milestone, contactMethod } = req.body;
+    const milestoneNum = Number(milestone);
+    if (!REFERRAL_MILESTONES.includes(milestoneNum)) {
+      return res.status(400).json({ message: 'Invalid milestone.' });
+    }
+    if (!['livechat', 'email'].includes(contactMethod)) {
+      return res.status(400).json({ message: 'Please choose Live Chat or Email as your contact method.' });
+    }
+
+    const user = await User.findOne({ email: req.userEmail });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    user.milestoneClaims = user.milestoneClaims || [];
+    if (user.milestoneClaims.some(function (c) { return c.milestone === milestoneNum; })) {
+      return res.status(400).json({ message: 'You already claimed this milestone.' });
+    }
+
+    // সত্যিকারের count — সবসময় DB থেকে fresh গোনা হয়, client-supplied নয়
+    const successfulCount = await User.countDocuments({ referredBy: user.referralCode, hasPaidBefore: true });
+    if (successfulCount < milestoneNum) {
+      return res.status(400).json({ message: 'You have not reached this milestone yet (' + successfulCount + '/' + milestoneNum + ' successful referrals).' });
+    }
+
+    user.milestoneClaims.push({
+      id: crypto.randomUUID(),
+      milestone: milestoneNum,
+      contactMethod: contactMethod,
+      status: 'pending',
+      requestedAt: Date.now()
+    });
+    user.markModified('milestoneClaims');
+    await user.save();
+
+    res.json({
+      message: 'Milestone claim received for ' + milestoneNum + ' successful referrals. Continue on ' +
+        (contactMethod === 'livechat' ? 'Live Chat' : 'email') + ' to verify and receive your gift.',
+      milestone: milestoneNum
+    });
+  } catch (err) {
+    console.error('Error claiming milestone:', err.message || err);
+    res.status(500).json({ message: 'Server error claiming milestone' });
+  }
+});
+
+
 //     (লগইন টোকেন নয়, বরং ADMIN_SECRET এনভায়রনমেন্ট ভ্যারিয়েবল দিয়ে
 //     প্রোটেক্টেড — founder নিজে Razorpay dashboard থেকে refund করার
 //     পর এই রুটটা ম্যানুয়ালি (curl/Postman দিয়ে) কল করবে। ADMIN_SECRET
@@ -1136,7 +1222,7 @@ app.post('/api/admin/mark-refunded', async (req, res) => {
 });
 
 // ============================================================
-// ১৩. ADMIN — Founder-only business metrics (KPI)
+// ১৪. ADMIN — Founder-only business metrics (KPI)
 //     ADMIN_SECRET দিয়ে প্রোটেক্টেড; কাস্টমারদের ড্যাশবোর্ডে এসব দেখানো
 //     হয় না (MRR/churn শুধু founder-এর জন্য)। যা ডাটাবেসে আসলে আছে সেটা
 //     থেকেই হিসাব — অনুমানভিত্তিক অংশগুলো response-এর "notes"-এ লেখা আছে।
@@ -1219,6 +1305,47 @@ app.post('/api/admin/metrics', async (req, res) => {
   } catch (err) {
     console.error('Error computing metrics:', err.message || err);
     res.status(500).json({ message: 'Server error computing metrics' });
+  }
+});
+
+// ============================================================
+// ১৫. সাইট রেটিং — পাবলিক (লগইন লাগে না), কোনো ব্যক্তিগত তথ্য জমা হয় না
+// ============================================================
+app.get('/api/site-rating', async (req, res) => {
+  try {
+    const agg = await SiteRating.aggregate([
+      { $group: { _id: null, average: { $avg: '$stars' }, count: { $sum: 1 } } }
+    ]);
+    const row = agg[0] || { average: 0, count: 0 };
+    res.json({
+      average: Math.round((row.average || 0) * 10) / 10,
+      count: row.count || 0
+    });
+  } catch (err) {
+    console.error('Error fetching site rating:', err.message || err);
+    res.status(500).json({ message: 'Server error fetching site rating' });
+  }
+});
+
+app.post('/api/site-rating', async (req, res) => {
+  try {
+    const stars = Number((req.body || {}).stars);
+    if (!Number.isInteger(stars) || stars < 1 || stars > 5) {
+      return res.status(400).json({ message: 'stars must be an integer from 1 to 5.' });
+    }
+    await SiteRating.create({ stars: stars });
+    const agg = await SiteRating.aggregate([
+      { $group: { _id: null, average: { $avg: '$stars' }, count: { $sum: 1 } } }
+    ]);
+    const row = agg[0] || { average: 0, count: 0 };
+    res.json({
+      message: 'Thanks for rating EANOVA!',
+      average: Math.round((row.average || 0) * 10) / 10,
+      count: row.count || 0
+    });
+  } catch (err) {
+    console.error('Error submitting site rating:', err.message || err);
+    res.status(500).json({ message: 'Server error submitting site rating' });
   }
 });
 
