@@ -1161,7 +1161,8 @@ app.post('/api/referral/claim-milestone', requireAuth, async (req, res) => {
   }
 });
 
-
+// ============================================================
+// ১৩. ADMIN — রিফান্ড হলে referral কমিশন reverse করা
 //     (লগইন টোকেন নয়, বরং ADMIN_SECRET এনভায়রনমেন্ট ভ্যারিয়েবল দিয়ে
 //     প্রোটেক্টেড — founder নিজে Razorpay dashboard থেকে refund করার
 //     পর এই রুটটা ম্যানুয়ালি (curl/Postman দিয়ে) কল করবে। ADMIN_SECRET
@@ -1348,6 +1349,14 @@ app.post('/api/site-rating', async (req, res) => {
     res.status(500).json({ message: 'Server error submitting site rating' });
   }
 });
+
+// ============================================================
+// ১৬. ADMIN PANEL (admin.js) — founder-only লগইন + ইউজার লিস্ট +
+//     রেফারেল আর্নিং এডিট। ADMIN_USERNAME ও ADMIN_PASSWORD env variable
+//     সেট না থাকলে এর সব রুট নিরাপদে বন্ধ থাকে।
+//     (এটা অবশ্যই নিচের 404 ফলব্যাকের আগে থাকতে হবে)
+// ============================================================
+require('./admin')(app, { User, summarizePoints });
 
 // ============================================================
 // ফলব্যাক — অজানা রুটে জেনেরিক 404 (স্ট্যাক ট্রেস বা ইন্টারনাল ইনফো ফাঁস করে না)
