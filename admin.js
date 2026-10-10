@@ -300,6 +300,41 @@ module.exports = function mountAdmin(app, deps) {
   });
 
   // ------------------------------------------------------------
+  // POST /api/admin/users/:id/withdrawals/:wid/status { status: 'success' | 'pending' }
+  // ইউজারের withdrawal রিকোয়েস্ট সম্পন্ন (success) করা, বা ভুল হলে আবার
+  // pending-এ ফেরানো। এটা শুধু স্ট্যাটাস বদলায় — ব্যালেন্স আলাদাভাবে
+  // "Set available balance" দিয়ে আপনি নিজে ঠিক করবেন।
+  // ------------------------------------------------------------
+  app.post('/api/admin/users/:id/withdrawals/:wid/status', requireAdmin, async (req, res) => {
+    try {
+      noStore(res);
+      const status = String((req.body || {}).status || '');
+      if (!['success', 'pending'].includes(status)) {
+        return res.status(400).json({ message: 'Status must be success or pending.' });
+      }
+      if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({ message: 'Invalid user id' });
+      }
+      const user = await User.findById(req.params.id);
+      if (!user) return res.status(404).json({ message: 'User not found' });
+
+      const wr = (user.withdrawalRequests || []).find(function (w) { return w.id === req.params.wid; });
+      if (!wr) return res.status(404).json({ message: 'Withdrawal request not found' });
+
+      wr.status = status;
+      if (status === 'success') wr.completedAt = Date.now();
+      else delete wr.completedAt;
+      user.markModified('withdrawalRequests');
+      await user.save();
+      console.log('[admin] withdrawal', wr.id, 'of', user.email, 'marked', status);
+      res.json({ message: status === 'success' ? 'Marked as success.' : 'Moved back to pending.' });
+    } catch (err) {
+      console.error('Admin withdrawal status error:', err.message || err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  });
+
+  // ------------------------------------------------------------
   // POST /api/admin/users/:id/ledger/:entryId/:action   (action = reverse | restore)
   // একটা নির্দিষ্ট কমিশন এন্ট্রি বাতিল (reverse) বা আবার চালু (restore)।
   // ------------------------------------------------------------

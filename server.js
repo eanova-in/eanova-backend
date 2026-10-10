@@ -1045,10 +1045,12 @@ app.get('/api/referral/info', requireAuth, async (req, res) => {
 // ============================================================
 // ১১. SHARE & EARN — উইথড্রয়াল রিকোয়েস্ট
 //     (আসল টাকা পাঠানো ম্যানুয়ালি হবে — এই রুট শুধু রিকোয়েস্টটা
-//     রেকর্ড করে রাখে এবং সেই মুহূর্তের available পয়েন্ট lock করে,
-//     যাতে একই পয়েন্ট দুইবার withdraw request করা না যায়। ইউজারকে
-//     Live Chat / email-এ গিয়ে বিস্তারিত (bank/UPI QR) জানাতে হবে,
-//     তারপর founder ম্যানুয়ালি টাকা পাঠাবে।)
+//     'pending' হিসেবে রেকর্ড করে রাখে। ইউজারের ব্যালেন্স এখানে আর
+//     কমানো/শূন্য করা হয় না — ব্যালেন্স কত থাকবে সেটা founder নিজে
+//     Admin Panel থেকে ঠিক করে। রিকোয়েস্ট সম্পন্ন হলে founder Admin
+//     Panel থেকে সেটাকে 'success' করে দেয়। ইউজারকে Live Chat / email-এ
+//     গিয়ে বিস্তারিত (bank/UPI QR) জানাতে হবে, তারপর founder
+//     ম্যানুয়ালি টাকা পাঠাবে।)
 // ============================================================
 app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
   try {
@@ -1073,14 +1075,7 @@ app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
     const now = Date.now();
     const amount = points.availableBalance;
 
-    // এই মুহূর্তে যা "available" ছিল, সেই ledger entry-গুলোকে withdrawn
-    // মার্ক করে দেওয়া হচ্ছে, যাতে দ্বিতীয়বার একই পয়েন্ট withdraw
-    // request করা না যায়।
-    (user.pointsLedger || []).forEach(function (e) {
-      if (e.type === 'earn' && e.status === 'active' && now >= e.availableAt) {
-        e.status = 'withdrawn';
-      }
-    });
+    // ব্যালেন্স বদলানো হয় না — শুধু রিকোয়েস্টটা pending হিসেবে জমা থাকে।
 
     user.withdrawalRequests = user.withdrawalRequests || [];
     user.withdrawalRequests.push({
@@ -1093,7 +1088,6 @@ app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
       status: 'pending'
     });
 
-    user.markModified('pointsLedger');
     user.markModified('withdrawalRequests');
     await user.save();
 
