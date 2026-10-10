@@ -1044,13 +1044,13 @@ app.get('/api/referral/info', requireAuth, async (req, res) => {
 
 // ============================================================
 // ১১. SHARE & EARN — উইথড্রয়াল রিকোয়েস্ট
-//     (আসল টাকা পাঠানো ম্যানুয়ালি হবে — এই রুট শুধু রিকোয়েস্টটা
-//     'pending' হিসেবে রেকর্ড করে রাখে। ইউজারের ব্যালেন্স এখানে আর
-//     কমানো/শূন্য করা হয় না — ব্যালেন্স কত থাকবে সেটা founder নিজে
-//     Admin Panel থেকে ঠিক করে। রিকোয়েস্ট সম্পন্ন হলে founder Admin
-//     Panel থেকে সেটাকে 'success' করে দেয়। ইউজারকে Live Chat / email-এ
-//     গিয়ে বিস্তারিত (bank/UPI QR) জানাতে হবে, তারপর founder
-//     ম্যানুয়ালি টাকা পাঠাবে।)
+//     (আসল টাকা পাঠানো ম্যানুয়ালি হবে। ইউজার রিকোয়েস্ট করলে সেই
+//     মুহূর্তের available ব্যালেন্স রিকোয়েস্টে চলে যায় — ব্যালেন্স ₹0 হয়ে
+//     যায় ও রিকোয়েস্টটা "pending" হিসেবে হিস্টোরিতে জমা হয় ("Total
+//     earned" একই থাকে)। পরে founder Admin Panel থেকে রিকোয়েস্টটা "success"
+//     করে এবং চাইলে নতুন ব্যালেন্স সেট করে। ইউজারকে Live Chat / email-এ
+//     গিয়ে বিস্তারিত (bank/UPI) জানাতে হবে, তারপর founder ম্যানুয়ালি
+//     টাকা পাঠাবে।)
 // ============================================================
 app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
   try {
@@ -1075,7 +1075,14 @@ app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
     const now = Date.now();
     const amount = points.availableBalance;
 
-    // ব্যালেন্স বদলানো হয় না — শুধু রিকোয়েস্টটা pending হিসেবে জমা থাকে।
+    // এই মুহূর্তে যা "available" ছিল, সেই ledger entry-গুলোকে withdrawn
+    // মার্ক করা হচ্ছে — ফলে available ব্যালেন্স ₹0 হয়ে যায়, আর একই পয়েন্ট
+    // দুইবার withdraw request করা যায় না। (Total earned বদলায় না।)
+    (user.pointsLedger || []).forEach(function (e) {
+      if (e.type === 'earn' && e.status === 'active' && now >= e.availableAt) {
+        e.status = 'withdrawn';
+      }
+    });
 
     user.withdrawalRequests = user.withdrawalRequests || [];
     user.withdrawalRequests.push({
@@ -1088,6 +1095,7 @@ app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
       status: 'pending'
     });
 
+    user.markModified('pointsLedger');
     user.markModified('withdrawalRequests');
     await user.save();
 
