@@ -25,6 +25,10 @@ const userSchema = new mongoose.Schema({
   subscriptionExpiry: { type: Number, default: null }, // ms epoch timestamp
   hasPaidBefore: { type: Boolean, default: false },
 
+  // যেসব Razorpay payment ID এই একাউন্টে আগেই প্রসেস হয়ে গেছে। একই payment
+  // দিয়ে দ্বিতীয়বার plan চালু বা রেফারেল কমিশন নেওয়া ঠেকাতে ব্যবহার হয়।
+  paymentsProcessed: { type: [String], default: [] },
+
   profilePic: { type: String, default: '' }, // data URL, so cross-device profile photo works
 
   // Free-trial daily reconciliation cap: one match per calendar day.

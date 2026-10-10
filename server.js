@@ -554,6 +554,21 @@ const PLAN_BASE_INR = {
 };
 const GST_RATE = 0.18;
 
+// create-order রুটের হিসাবের হুবহু একই — একটা plan-এর মোট দাম (GST সহ) পয়সায়।
+// verify-payment-এ Razorpay-র order-এর amount এর সাথে মেলাতে ব্যবহার হয়।
+function planAmountPaise(plan) {
+  const base = PLAN_BASE_INR[plan];
+  const gst = Math.round(base * GST_RATE * 100) / 100;
+  const total = Math.round((base + gst) * 100) / 100;
+  return Math.round(total * 100);
+}
+
+// একই মুহূর্তে একই payment / একই ইউজারের withdrawal দুইবার প্রসেস হওয়া
+// (parallel রিকোয়েস্ট পাঠিয়ে ডাবল ক্রেডিট বা ডাবল withdrawal) ঠেকানোর তালা।
+// Render-এ একটাই সার্ভার প্রসেস চলে, তাই মেমোরির তালাই যথেষ্ট।
+const paymentLocks = new Set();
+const withdrawalLocks = new Set();
+
 // ============================================================
 // SHARE & EARN (রেফারেল) — কনস্ট্যান্ট ও হেল্পার
 //
@@ -668,6 +683,9 @@ async function creditReferralCommission(buyerUser, plan, purchaseRef) {
     const referrer = await User.findOne({ referralCode: buyerUser.referredBy });
     if (!referrer || referrer.email === buyerUser.email) return; // self-referral গার্ড
 
+    // একই payment-এর জন্য দ্বিতীয়বার কমিশন কখনো নয় (replay গার্ড)
+    if ((referrer.pointsLedger || []).some(function (e) { return e.purchaseRef === purchaseRef; })) return;
+
     // প্রথম-রেফারেল বোনাস: শুধু যদি (ক) এই buyer-ই referrer-এর সবচেয়ে প্রথম
     // referred account হয়, এবং (খ) এটা তার প্রথম কেনা (এই buyer থেকে আগে
     // কোনো commission entry নেই)। প্রথম referred ব্যক্তি কিছু না কিনলে বোনাস
@@ -771,17 +789,19 @@ app.post('/api/razorpay/create-order', requireAuth, async (req, res) => {
 });
 
 app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
+  let lockedPaymentId = null;
   try {
-    if (!process.env.RAZORPAY_KEY_SECRET) {
-      console.error('RAZORPAY_KEY_SECRET env variable not set — refusing to verify payment.');
+    if (!process.env.RAZORPAY_KEY_SECRET || !process.env.RAZORPAY_KEY_ID) {
+      console.error('RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET env variable(s) not set — refusing to verify payment.');
       return res.status(500).json({ message: 'Payments are not configured on the server yet.' });
     }
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body;
+    // plan এখানে ক্লায়েন্ট থেকে নেওয়া হয় না — নিচে Razorpay-র নিজস্ব order
+    // থেকে সার্ভার নিজে বের করে (কম দামের plan কিনে দামি plan দাবি করা ঠেকাতে)।
+    const razorpay_order_id = String((req.body || {}).razorpay_order_id || '');
+    const razorpay_payment_id = String((req.body || {}).razorpay_payment_id || '');
+    const razorpay_signature = String((req.body || {}).razorpay_signature || '');
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({ message: 'Missing payment details' });
-    }
-    if (!PLAN_DURATIONS_MS[plan]) {
-      return res.status(400).json({ message: 'Invalid plan selected' });
     }
 
     // Razorpay-র নিজস্ব নিয়ম: HMAC-SHA256("order_id|payment_id", key_secret)
@@ -802,18 +822,64 @@ app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
       return res.status(400).json({ message: 'Payment verification failed. If money was deducted, please contact support.' });
     }
 
+    // একই payment একসাথে দুইবার প্রসেস হতে দেওয়া হয় না
+    if (paymentLocks.has(razorpay_payment_id)) {
+      return res.status(409).json({ message: 'This payment is already being confirmed. Please wait a moment.' });
+    }
+    paymentLocks.add(razorpay_payment_id);
+    lockedPaymentId = razorpay_payment_id;
+
+    // Razorpay থেকে order-টা নিজে এনে দেখা হচ্ছে — plan, দাম ও কার order সব
+    // সেখান থেকে নিশ্চিত হয়, ক্লায়েন্টের কথায় ভরসা করা হয় না।
+    let order;
+    try {
+      const rzAuth = 'Basic ' + Buffer.from(process.env.RAZORPAY_KEY_ID + ':' + process.env.RAZORPAY_KEY_SECRET).toString('base64');
+      const orderRes = await fetch('https://api.razorpay.com/v1/orders/' + encodeURIComponent(razorpay_order_id), {
+        headers: { 'Authorization': rzAuth }
+      });
+      if (!orderRes.ok) throw new Error('HTTP ' + orderRes.status);
+      order = await orderRes.json();
+    } catch (orderErr) {
+      console.error('[razorpay/verify-payment] could not fetch order:', orderErr.message || orderErr);
+      return res.status(502).json({ message: 'Could not confirm your payment right now. Please try again in a minute — your payment is safe.' });
+    }
+
+    const plan = order && order.notes && order.notes.plan;
+    if (!order || order.id !== razorpay_order_id || !PLAN_DURATIONS_MS[plan] || !PLAN_BASE_INR[plan] ||
+        String(order.notes.userId) !== String(req.userId) ||
+        Number(order.amount) !== planAmountPaise(plan)) {
+      console.error('[razorpay/verify-payment] order mismatch for', req.userEmail, 'order', razorpay_order_id);
+      return res.status(400).json({ message: 'Payment details do not match this account or plan. If money was deducted, please contact support.' });
+    }
+
     const user = await User.findOne({ email: req.userEmail });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    // ঠিক update-profile রুট যা করে সেই একই activation — এখানে আলাদাভাবে
-    // লেখা হলো যাতে সেই existing রুটটা একদম অক্ষত থাকে।
+    // এই payment আগেই প্রসেস হয়ে গেছে (যেমন নেটওয়ার্ক retry) — আবার plan চালু
+    // বা কমিশন ক্রেডিট না করে, বর্তমান অবস্থাটাই সফল হিসেবে ফেরত দেওয়া হয়।
+    if ((user.paymentsProcessed || []).includes(razorpay_payment_id)) {
+      return res.json({
+        message: 'Payment already confirmed.',
+        razorpayPaymentId: razorpay_payment_id,
+        user: {
+          name: user.name, firm: user.firm, email: user.email, region: user.region,
+          subscriptionActive: user.subscriptionActive, activePlan: user.activePlan,
+          subscriptionExpiry: user.subscriptionExpiry, hasPaidBefore: user.hasPaidBefore,
+          profilePic: user.profilePic
+        }
+      });
+    }
+
     user.subscriptionActive = true;
     user.activePlan = plan;
     user.subscriptionExpiry = Date.now() + PLAN_DURATIONS_MS[plan];
     user.hasPaidBefore = true;
+    user.paymentsProcessed = user.paymentsProcessed || [];
+    user.paymentsProcessed.push(razorpay_payment_id);
     user.markModified('subscriptionActive');
     user.markModified('activePlan');
     user.markModified('subscriptionExpiry');
+    user.markModified('paymentsProcessed');
     await user.save();
 
     const verify = await User.findOne({ email: req.userEmail });
@@ -845,6 +911,8 @@ app.post('/api/razorpay/verify-payment', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Verify payment error:', error.message || error);
     res.status(500).json({ message: 'Server error while verifying payment' });
+  } finally {
+    if (lockedPaymentId) paymentLocks.delete(lockedPaymentId);
   }
 });
 
@@ -862,19 +930,11 @@ app.post('/api/update-profile', requireAuth, ensureOwnEmail, async (req, res) =>
     const user = await User.findOne({ email: req.userEmail });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    // --- সাবস্ক্রিপশন/প্ল্যান পরিবর্তন (demo checkout থেকে আসে) ---
-    // এখানে শুধু whitelisted plan নাম গ্রহণযোগ্য; দাম ও মেয়াদ
-    // সার্ভার নিজে PLAN_DURATIONS_MS থেকে হিসাব করে — ক্লায়েন্ট
-    // থেকে subscriptionActive:true বা কোনো amount পাঠিয়ে বিনামূল্যে
-    // অ্যাক্টিভেট করা যাবে না।
+    // প্ল্যান চালু করা এখান থেকে আর সম্ভব না — শুধু Razorpay-তে আসল পেমেন্ট
+    // verify হলেই (/api/razorpay/verify-payment) সাবস্ক্রিপশন চালু হয়। আগে এখানে
+    // plan পাঠিয়ে বিনা পয়সায় প্ল্যান ও "সফল রেফারেল" বানানো সম্ভব ছিল।
     if (plan !== undefined) {
-      if (!PLAN_DURATIONS_MS[plan]) {
-        return res.status(400).json({ message: 'Invalid plan selected' });
-      }
-      user.subscriptionActive = true;
-      user.activePlan = plan;
-      user.subscriptionExpiry = Date.now() + PLAN_DURATIONS_MS[plan];
-      user.hasPaidBefore = true;
+      return res.status(403).json({ message: 'Plans can only be activated through payment.' });
     }
 
     // --- প্রোফাইল তথ্য (ছবি/নাম/ফার্ম) — সংবেদনশীল নয়, স্বাভাবিকভাবেই আপডেট হয় ---
@@ -1053,6 +1113,12 @@ app.get('/api/referral/info', requireAuth, async (req, res) => {
 //     টাকা পাঠাবে।)
 // ============================================================
 app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
+  // একই ইউজারের দুটো withdrawal রিকোয়েস্ট একসাথে (parallel) ঢুকলে একটাই চলবে
+  const lockKey = String(req.userEmail).toLowerCase();
+  if (withdrawalLocks.has(lockKey)) {
+    return res.status(429).json({ message: 'Your withdrawal request is already being processed.' });
+  }
+  withdrawalLocks.add(lockKey);
   try {
     const { contactMethod, payoutMethod, payoutDetails } = req.body;
     if (!['livechat', 'email'].includes(contactMethod)) {
@@ -1107,6 +1173,8 @@ app.post('/api/points/request-withdrawal', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('Error requesting withdrawal:', err.message || err);
     res.status(500).json({ message: 'Server error requesting withdrawal' });
+  } finally {
+    withdrawalLocks.delete(lockKey);
   }
 });
 
