@@ -230,6 +230,7 @@ module.exports = function mountAdmin(app, deps) {
           availableBalance: points.availableBalance,
           onHold: points.onHold,
           totalEarned: points.totalEarned,
+          creditedTotal: points.creditedTotal,
           withdrawn: points.withdrawn,
           reversed: points.reversed
         },

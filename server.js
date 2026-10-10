@@ -622,17 +622,22 @@ function maskEmailServer(email) {
   return masked + '@' + parts[1];
 }
 
-// একজন ইউজারের pointsLedger থেকে available / on-hold / total ইত্যাদি হিসাব
-// করে — কোনো ডাটাবেস রাইট করে না, শুধু read-only summary।
+// একজন ইউজারের pointsLedger থেকে available / on-hold ইত্যাদি হিসাব করে —
+// কোনো ডাটাবেস রাইট করে না, শুধু read-only summary।
+//
+// "totalEarned" = ইউজার আসলে যত টাকা হাতে পেয়েছে, অর্থাৎ যেসব withdrawal
+// রিকোয়েস্ট founder "success" করেছে তাদের মোট। কমিশন জমা হলে বা founder
+// ব্যালেন্স সেট করলে এটা বাড়ে না — শুধু success হওয়া withdrawal যোগ হয়।
+// (কমিশন/অ্যাডজাস্টমেন্ট মিলিয়ে মোট জমার হিসাব আলাদা: "creditedTotal"।)
 function summarizePoints(user) {
   const now = Date.now();
   const ledger = user.pointsLedger || [];
-  let availableBalance = 0, onHold = 0, totalEarned = 0, withdrawn = 0, reversed = 0;
+  let availableBalance = 0, onHold = 0, creditedTotal = 0, withdrawn = 0, reversed = 0;
 
   const history = ledger.map(function (e) {
     let status = e.status;
     if (e.type === 'earn') {
-      totalEarned += e.amount;
+      creditedTotal += e.amount;
       if (e.status === 'reversed') {
         reversed += e.amount;
         status = 'reversed';
@@ -660,10 +665,15 @@ function summarizePoints(user) {
 
   history.sort(function (a, b) { return b.createdAt - a.createdAt; });
 
+  const paidOut = (user.withdrawalRequests || []).reduce(function (sum, w) {
+    return w && w.status === 'success' ? sum + (Number(w.amount) || 0) : sum;
+  }, 0);
+
   return {
     availableBalance: Math.round(availableBalance * 100) / 100,
     onHold: Math.round(onHold * 100) / 100,
-    totalEarned: Math.round(totalEarned * 100) / 100,
+    totalEarned: Math.round(paidOut * 100) / 100,
+    creditedTotal: Math.round(creditedTotal * 100) / 100,
     withdrawn: Math.round(withdrawn * 100) / 100,
     reversed: Math.round(reversed * 100) / 100,
     history: history
